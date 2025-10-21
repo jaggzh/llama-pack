@@ -1,4 +1,6 @@
 #!/usr/bin/env perl
+BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
+
 use v5.36;
 use JSON::PP;
 use File::Find;
@@ -8,6 +10,8 @@ use File::Basename;
 use Digest::MD5 qw(md5_hex);
 use Time::Piece;
 use Fcntl qw(:flock);
+no warnings 'once';
+use Text::Table;
 
 # bansi color exports
 our ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra);
@@ -181,7 +185,11 @@ sub load_config {
         $json =~ s|//.*$||gm;
         
         my $config = decode_json($json);
+        $config->{stats_file} = glob $config->{stats_file} if $config->{stats_file}//0;
         $config->{stats_file} //= "$config_dir/stats.json";
+        $config->{hdd_path} = glob $config->{hdd_path} if $config->{hdd_path}//0;
+        $config->{ssd_path} = glob $config->{ssd_path} if $config->{ssd_path}//0;
+        $config->{pid_dir} = glob $config->{pid_dir} if $config->{pid_dir}//0;
         $config->{pid_dir} //= '/tmp/llama-serve';
         return $config;
     }
@@ -190,7 +198,7 @@ sub load_config {
     my $config = {
         ssd_path => "$ENV{HOME}/models/ssd",
         hdd_path => "$ENV{HOME}/models/hdd",
-        ssd_min_free_gb => 20,
+        ssd_min_free_gb => 30,
         server_binary => 'llama-server',
         default_port => 8080,
         stats_file => "$config_dir/stats.json",
@@ -240,6 +248,7 @@ sub scan_models {
     my $stats = load_stats($config);
     
     for my $location (qw(ssd hdd)) {
+        $DB::single=1;
         my $path = $config->{"${location}_path"};
         next unless -d $path;
         
@@ -252,18 +261,27 @@ sub scan_models {
             $stats->{$key}{path} = $full_path;
             $stats->{$key}{location} = $location;
             $stats->{$key}{size_bytes} = -s $full_path;
+            $stats->{$key}{mtime} = (stat($full_path))[9];
             
         }, $path);
     }
     
     # Write updated stats
-    open my $fh, '>', $config->{stats_file} or die "Can't write stats: $!";
+    open my $fh, '>', $config->{stats_file} or die "Can't write stats ($config->{stats_file}): $!";
     print $fh JSON::PP->new->pretty->encode($stats);
     close $fh;
 }
 
 sub find_model {
     my ($config, $stats, $model_name) = @_;
+    
+    # Calculate mtime range for ranking
+    my ($newest_mtime, $oldest_mtime) = (0, time);
+    for my $model (keys %$stats) {
+        my $mtime = $stats->{$model}{mtime} // 0;
+        $newest_mtime = $mtime if $mtime > $newest_mtime;
+        $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
+    }
     
     # Try exact match first
     if ($stats->{$model_name}) {
@@ -291,15 +309,16 @@ sub find_model {
         # Multiple matches - pick highest ranked
         say "${yel}Multiple models found matching '$model_name':$rst";
         my @ranked = sort { 
-            rank_model($stats->{$b}) <=> rank_model($stats->{$a}) 
+            rank_model($stats->{$b}, $newest_mtime, $oldest_mtime) <=> 
+            rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) 
         } @matches;
         
         for my $m (@ranked) {
-            my $rank = rank_model($stats->{$m});
+            my $rank = sprintf("%.1f", rank_model($stats->{$m}, $newest_mtime, $oldest_mtime));
             say "  $m (rank: $rank)";
         }
         
-        my $chosen = $ranked[0];
+        my $chosen = $ranked[-1];  # Highest rank is at end now
         say "${gre}Using highest-ranked: $chosen$rst";
         
         return {
@@ -310,14 +329,22 @@ sub find_model {
 }
 
 sub rank_model {
-    my $mstats = shift;
+    my ($mstats, $newest_mtime, $oldest_mtime) = @_;
     
     my $total_uses = $mstats->{total_uses} // 0;
     my $last_used = $mstats->{last_used};
     my $days_since = $last_used ? days_ago($last_used) : 999;
     
-    # Simple ranking: recent use matters most
-    return $total_uses - ($days_since * 2);
+    # File mtime bonus: normalize file age to 0-1 range, scale to small bonus
+    my $mtime_bonus = 0;
+    if ($mstats->{mtime} && $newest_mtime && $oldest_mtime && $newest_mtime != $oldest_mtime) {
+        # Newer files get higher bonus (0 to 0.5 points)
+        my $normalized = ($mstats->{mtime} - $oldest_mtime) / ($newest_mtime - $oldest_mtime);
+        $mtime_bonus = $normalized * 0.5;
+    }
+    
+    # Simple ranking: recent use matters most, slight nudge for new files
+    return $total_uses - ($days_since * 2) + $mtime_bonus;
 }
 
 sub days_ago {
@@ -487,24 +514,47 @@ sub list_models {
     my $config = shift;
     my $stats = load_stats($config);
     
+    # Calculate mtime range for normalization
+    my ($newest_mtime, $oldest_mtime) = (0, time);
+    for my $model (keys %$stats) {
+        my $mtime = $stats->{$model}{mtime} // 0;
+        $newest_mtime = $mtime if $mtime > $newest_mtime;
+        $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
+    }
+    
     my @models = sort { 
-        rank_model($stats->{$b}) <=> rank_model($stats->{$a}) 
+        rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) <=> 
+        rank_model($stats->{$b}, $newest_mtime, $oldest_mtime)
     } keys %$stats;
     
-    say "${whi}${inv} Models (sorted by rank) $rst\n";
+    say "${whi}${inv} Models (lowest to highest rank) $rst\n";
     
+	my $tb = Text::Table->new(
+		{ title => "Model", align => 'left' },
+		{ title => "Rank", align => 'point', align_title => 'center'  },
+		{ title => "Uses", align => 'right', align_title => 'right' },
+		# { is_sep=>1, body=>'  ', },
+		\"  ",
+		{ title => "Loc", align => 'left' },
+		{ title => "Last", align => 'left' },
+	);
+
     for my $model (@models) {
         my $mstats = $stats->{$model};
-        my $rank = rank_model($mstats);
+        my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
         my $uses = $mstats->{total_uses} // 0;
         my $loc = $mstats->{location} // '?';
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
         
         my $loc_color = $loc eq 'ssd' ? $gre : $yel;
         
-        printf "%s%-40s$rst  rank:%4d  uses:%3d  loc:%s%-3s$rst  last:%s\n",
-            $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
+        # printf "%s%-40s$rst  rank:%6s  uses:%3d  loc:%s%-3s$rst  last:%s\n",
+        #     $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
+        $tb->add("$cya$model$rst", $rank, $uses,
+        	$loc_color . uc($loc) . $rst,
+        	$last);
     }
+    print $tb;
 }
 
 sub serr {
