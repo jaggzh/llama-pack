@@ -1,0 +1,544 @@
+#!/usr/bin/env perl
+use v5.36;
+use JSON::PP;
+use File::Find;
+use File::Path qw(make_path);
+use File::Copy;
+use File::Basename;
+use Digest::MD5 qw(md5_hex);
+use Time::Piece;
+use Fcntl qw(:flock);
+
+# bansi color exports
+our ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra);
+our ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra);
+our ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi);
+our ($rst, $inv, $cll, $cllr, $cls, $clsb, $ahome);
+
+init_colors();
+
+our $verbose = $ENV{LLAMA_SERVE_VERBOSE} // 0;
+our $stats_dirty = 0;
+our $current_runtime_start;
+
+END {
+    write_stats() if $stats_dirty;
+}
+
+$SIG{INT} = $SIG{TERM} = sub {
+    update_current_runtime() if $current_runtime_start;
+    $stats_dirty = 1;
+    exit 0;
+};
+
+main();
+
+sub main {
+    my $config = load_config();
+    
+    # Parse our args vs llama-server args
+    my ($opts, $llama_args) = parse_args();
+    
+    # Handle commands that don't need model loading
+    if ($opts->{list}) {
+        list_models($config);
+        exit 0;
+    }
+    
+    if ($opts->{update}) {
+        scan_models($config);
+        say "${gre}Model index updated.$rst";
+        exit 0;
+    }
+    
+    if ($opts->{kill}) {
+        kill_instances($config, $opts);
+        exit 0;
+    }
+    
+    # Need a model to proceed
+    unless ($opts->{model}) {
+        serr(0, "No model specified. Use -m or --model");
+        exit 1;
+    }
+    
+    # Auto-scan on first run if no stats file exists
+    unless (-f $config->{stats_file}) {
+        say "${yel}First run detected. Scanning for models...$rst";
+        scan_models($config);
+    }
+    
+    # Load stats
+    my $stats = load_stats($config);
+    
+    # Find the model
+    my $model_info = find_model($config, $stats, $opts->{model});
+    unless ($model_info) {
+        serr(0, "Model '$$opts{model}' not found.");
+        exit 1;
+    }
+    
+    say "${gre}Found model: $$model_info{path}$rst" if $verbose;
+    
+    # Check if already running with same args
+    my $pid_file = get_pid_file($config, $opts->{port});
+    if (-f $pid_file) {
+        my $running = read_pid_file($pid_file);
+        if ($running && process_exists($running->{pid})) {
+            my $args_hash = md5_hex(join('|', @$llama_args));
+            if ($running->{model} eq $model_info->{path} && 
+                $running->{args_hash} eq $args_hash) {
+                say "${gre}Model already running on port $$opts{port} with same args.$rst";
+                exit 0;
+            } else {
+                say "${yel}Killing existing server to reload with different model/args...$rst";
+                kill_pid($running->{pid});
+                unlink $pid_file;
+            }
+        }
+    }
+    
+    # Update stats for this model
+    my $model_key = basename($model_info->{path});
+    $stats->{$model_key} //= {};
+    my $mstats = $stats->{$model_key};
+    
+    $mstats->{path} = $model_info->{path};
+    $mstats->{total_uses} //= 0;
+    $mstats->{total_uses}++;
+    $mstats->{last_used} = gmtime->datetime;
+    $mstats->{use_timestamps} //= [];
+    push @{$mstats->{use_timestamps}}, gmtime->datetime;
+    
+    # Keep only last 100 timestamps to prevent bloat
+    if (@{$mstats->{use_timestamps}} > 100) {
+        $mstats->{use_timestamps} = [
+            @{$mstats->{use_timestamps}}[-100..-1]
+        ];
+    }
+    
+    $stats_dirty = 1;
+    
+    # Should we cache to SSD?
+    if ($model_info->{location} eq 'hdd' && should_cache_to_ssd($mstats)) {
+        say "${yel}Model used multiple times recently. Caching to SSD...$rst";
+        fork_ssd_copy($config, $model_info, $stats);
+    }
+    
+    # Start llama-server
+    start_server($config, $opts, $model_info, $llama_args);
+}
+
+sub parse_args {
+    my %opts = (
+        port => 8080,
+        list => 0,
+        update => 0,
+        kill => 0,
+        kill_all => 0,
+    );
+    my @llama_args;
+    
+    while (@ARGV) {
+        my $arg = shift @ARGV;
+        
+        if ($arg eq '-m' || $arg eq '--model') {
+            $opts{model} = shift @ARGV;
+        } elsif ($arg eq '-l' || $arg eq '--list') {
+            $opts{list} = 1;
+        } elsif ($arg eq '--update') {
+            $opts{update} = 1;
+        } elsif ($arg eq '-k' || $arg eq '--kill') {
+            $opts{kill} = 1;
+        } elsif ($arg eq '--all') {
+            $opts{kill_all} = 1;
+        } elsif ($arg eq '--port') {
+            my $port = shift @ARGV;
+            $opts{port} = $port;
+            push @llama_args, $arg, $port;
+        } elsif ($arg eq '-v' || $arg eq '--verbose') {
+            $verbose++;
+        } else {
+            push @llama_args, $arg;
+        }
+    }
+    
+    return (\%opts, \@llama_args);
+}
+
+sub load_config {
+    my $config_dir = $ENV{HOME} . '/.config/llama-serve';
+    my $config_file = "$config_dir/config.json";
+    
+    make_path($config_dir) unless -d $config_dir;
+    
+    if (-f $config_file) {
+        open my $fh, '<', $config_file or die "Can't read config: $!";
+        my $json = do { local $/; <$fh> };
+        close $fh;
+        
+        # Remove // comments
+        $json =~ s|//.*$||gm;
+        
+        my $config = decode_json($json);
+        $config->{stats_file} //= "$config_dir/stats.json";
+        $config->{pid_dir} //= '/tmp/llama-serve';
+        return $config;
+    }
+    
+    # Create default config
+    my $config = {
+        ssd_path => "$ENV{HOME}/models/ssd",
+        hdd_path => "$ENV{HOME}/models/hdd",
+        ssd_min_free_gb => 20,
+        server_binary => 'llama-server',
+        default_port => 8080,
+        stats_file => "$config_dir/stats.json",
+        pid_dir => '/tmp/llama-serve',
+    };
+    
+    open my $fh, '>', $config_file or die "Can't write config: $!";
+    print $fh JSON::PP->new->pretty->encode($config);
+    close $fh;
+    
+    say "${yel}Created default config at: $config_file$rst";
+    say "${yel}Edit paths before running with a model.$rst";
+    
+    return $config;
+}
+
+sub load_stats {
+    my $config = shift;
+    my $file = $config->{stats_file};
+    
+    return {} unless -f $file;
+    
+    open my $fh, '<', $file or return {};
+    my $json = do { local $/; <$fh> };
+    close $fh;
+    
+    return decode_json($json);
+}
+
+sub write_stats {
+    my $config = load_config();
+    my $stats = load_stats($config);
+    
+    open my $fh, '>', $config->{stats_file} or do {
+        serr(0, "Can't write stats: $!");
+        return;
+    };
+    
+    print $fh JSON::PP->new->pretty->encode($stats);
+    close $fh;
+    
+    $stats_dirty = 0;
+}
+
+sub scan_models {
+    my $config = shift;
+    my $stats = load_stats($config);
+    
+    for my $location (qw(ssd hdd)) {
+        my $path = $config->{"${location}_path"};
+        next unless -d $path;
+        
+        find(sub {
+            return unless -f && /\.gguf$/i;
+            my $full_path = $File::Find::name;
+            my $key = basename($full_path);
+            
+            $stats->{$key} //= {};
+            $stats->{$key}{path} = $full_path;
+            $stats->{$key}{location} = $location;
+            $stats->{$key}{size_bytes} = -s $full_path;
+            
+        }, $path);
+    }
+    
+    # Write updated stats
+    open my $fh, '>', $config->{stats_file} or die "Can't write stats: $!";
+    print $fh JSON::PP->new->pretty->encode($stats);
+    close $fh;
+}
+
+sub find_model {
+    my ($config, $stats, $model_name) = @_;
+    
+    # Try exact match first
+    if ($stats->{$model_name}) {
+        return {
+            path => $stats->{$model_name}{path},
+            location => $stats->{$model_name}{location} // 'unknown',
+        };
+    }
+    
+    # Try substring match
+    my @matches;
+    for my $key (keys %$stats) {
+        push @matches, $key if $key =~ /\Q$model_name\E/i;
+    }
+    
+    if (@matches == 0) {
+        return undef;
+    } elsif (@matches == 1) {
+        my $key = $matches[0];
+        return {
+            path => $stats->{$key}{path},
+            location => $stats->{$key}{location} // 'unknown',
+        };
+    } else {
+        # Multiple matches - pick highest ranked
+        say "${yel}Multiple models found matching '$model_name':$rst";
+        my @ranked = sort { 
+            rank_model($stats->{$b}) <=> rank_model($stats->{$a}) 
+        } @matches;
+        
+        for my $m (@ranked) {
+            my $rank = rank_model($stats->{$m});
+            say "  $m (rank: $rank)";
+        }
+        
+        my $chosen = $ranked[0];
+        say "${gre}Using highest-ranked: $chosen$rst";
+        
+        return {
+            path => $stats->{$chosen}{path},
+            location => $stats->{$chosen}{location} // 'unknown',
+        };
+    }
+}
+
+sub rank_model {
+    my $mstats = shift;
+    
+    my $total_uses = $mstats->{total_uses} // 0;
+    my $last_used = $mstats->{last_used};
+    my $days_since = $last_used ? days_ago($last_used) : 999;
+    
+    # Simple ranking: recent use matters most
+    return $total_uses - ($days_since * 2);
+}
+
+sub days_ago {
+    my $timestamp = shift;
+    return 999 unless $timestamp;
+    
+    my $then = eval { Time::Piece->strptime($timestamp, '%Y-%m-%dT%H:%M:%S') };
+    return 999 unless $then;
+    
+    my $diff = time - $then->epoch;
+    return $diff / 86400;
+}
+
+sub should_cache_to_ssd {
+    my $mstats = shift;
+    my $timestamps = $mstats->{use_timestamps} // [];
+    
+    my $count = 0;
+    for my $ts (@$timestamps) {
+        $count++ if days_ago($ts) < 1;
+    }
+    
+    return $count >= 2;
+}
+
+sub fork_ssd_copy {
+    my ($config, $model_info, $stats) = @_;
+    
+    my $pid = fork();
+    if ($pid == 0) {
+        # Child process
+        my $src = $model_info->{path};
+        my $dst = $config->{ssd_path} . '/' . basename($src);
+        
+        say "${blu}[Background] Copying to SSD: $src -> $dst$rst" if $verbose;
+        
+        copy($src, $dst) or do {
+            serr(0, "[Background] Copy failed: $!");
+            exit 1;
+        };
+        
+        say "${gre}[Background] Copy complete.$rst" if $verbose;
+        exit 0;
+    }
+    # Parent continues
+}
+
+sub start_server {
+    my ($config, $opts, $model_info, $llama_args) = @_;
+    
+    my $binary = $config->{server_binary};
+    my @cmd = ($binary, '-m', $model_info->{path}, @$llama_args);
+    
+    say "${gre}Starting: " . join(' ', @cmd) . $rst if $verbose;
+    
+    # Fork server
+    my $pid = fork();
+    die "Fork failed: $!" unless defined $pid;
+    
+    if ($pid == 0) {
+        # Child - exec server
+        exec(@cmd) or die "Exec failed: $!";
+    }
+    
+    # Parent - write PID file and wait
+    $current_runtime_start = time;
+    write_pid_file($config, $opts->{port}, $pid, $model_info->{path}, $llama_args);
+    
+    say "${gre}Server started (PID: $pid, Port: $$opts{port})$rst";
+    
+    # Wait for server
+    waitpid($pid, 0);
+    
+    update_current_runtime();
+}
+
+sub get_pid_file {
+    my ($config, $port) = @_;
+    my $dir = $config->{pid_dir};
+    make_path($dir) unless -d $dir;
+    return "$dir/port-$port.pid";
+}
+
+sub write_pid_file {
+    my ($config, $port, $pid, $model, $llama_args) = @_;
+    
+    my $file = get_pid_file($config, $port);
+    my $args_hash = md5_hex(join('|', @$llama_args));
+    
+    open my $fh, '>', $file or die "Can't write PID file: $!";
+    print $fh "$pid|$port|$model|$args_hash\n";
+    close $fh;
+}
+
+sub read_pid_file {
+    my $file = shift;
+    
+    open my $fh, '<', $file or return undef;
+    my $line = <$fh>;
+    close $fh;
+    
+    chomp $line;
+    my ($pid, $port, $model, $args_hash) = split /\|/, $line;
+    
+    return {
+        pid => $pid,
+        port => $port,
+        model => $model,
+        args_hash => $args_hash,
+    };
+}
+
+sub process_exists {
+    my $pid = shift;
+    return kill(0, $pid);
+}
+
+sub kill_pid {
+    my $pid = shift;
+    kill('TERM', $pid);
+    sleep 1;
+    kill('KILL', $pid) if process_exists($pid);
+}
+
+sub kill_instances {
+    my ($config, $opts) = @_;
+    
+    my $pid_dir = $config->{pid_dir};
+    return unless -d $pid_dir;
+    
+    opendir my $dh, $pid_dir or return;
+    my @pid_files = grep { /\.pid$/ } readdir($dh);
+    closedir $dh;
+    
+    for my $file (@pid_files) {
+        next if $opts->{port} && $file ne "port-$$opts{port}.pid";
+        
+        my $full = "$pid_dir/$file";
+        my $running = read_pid_file($full);
+        
+        if ($running && process_exists($running->{pid})) {
+            say "${yel}Killing PID $$running{pid} on port $$running{port}$rst";
+            kill_pid($running->{pid});
+            unlink $full;
+        } else {
+            unlink $full;  # Stale PID file
+        }
+        
+        last unless $opts->{kill_all};
+    }
+}
+
+sub update_current_runtime {
+    return unless $current_runtime_start;
+    
+    my $config = load_config();
+    my $stats = load_stats($config);
+    
+    my $duration = time - $current_runtime_start;
+    
+    # Find current model from PID file
+    # For now, just mark stats dirty
+    $stats_dirty = 1;
+}
+
+sub list_models {
+    my $config = shift;
+    my $stats = load_stats($config);
+    
+    my @models = sort { 
+        rank_model($stats->{$b}) <=> rank_model($stats->{$a}) 
+    } keys %$stats;
+    
+    say "${whi}${inv} Models (sorted by rank) $rst\n";
+    
+    for my $model (@models) {
+        my $mstats = $stats->{$model};
+        my $rank = rank_model($mstats);
+        my $uses = $mstats->{total_uses} // 0;
+        my $loc = $mstats->{location} // '?';
+        my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
+        
+        my $loc_color = $loc eq 'ssd' ? $gre : $yel;
+        
+        printf "%s%-40s$rst  rank:%4d  uses:%3d  loc:%s%-3s$rst  last:%s\n",
+            $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
+    }
+}
+
+sub serr {
+    my ($level, @msg) = @_;
+    return if $verbose < $level;
+    say STDERR a24bg(100, 0, 0) . $whi, @msg, $rst;
+}
+
+sub init_colors {
+    if (-t STDOUT) {
+        ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra) =
+            map { "\e[${_}m" } (40..47);
+        ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra) =
+            map { "\e[${_}m" } (30..37);
+        ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi) =
+            map { "\e[${_}m" } (90..97);
+        $rst = "\e[0m";
+        $inv = "\e[7m";
+    } else {
+        ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra) = ('') x 8;
+        ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra) = ('') x 8;
+        ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi) = ('') x 8;
+        $rst = $inv = '';
+    }
+}
+
+sub a24bg {
+    my ($r, $g, $b) = @_;
+    return '' unless -t STDOUT;
+    return "\e[48;2;${r};${g};${b}m";
+}
+
+sub a24fg {
+    my ($r, $g, $b) = @_;
+    return '' unless -t STDOUT;
+    return "\e[38;2;${r};${g};${b}m";
+}
