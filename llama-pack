@@ -88,12 +88,41 @@ sub main {
     
     say "${gre}Found model: $$model_info{path}$rst" if $verbose;
     
+    # Handle model-specific args
+    my $model_key = basename($model_info->{path});
+    $stats->{$model_key} //= {};
+    my $mstats = $stats->{$model_key};
+    
+    # Determine which args to use
+    my @final_llama_args;
+    if (@$llama_args && (!$mstats->{llama_args} || $opts->{store})) {
+        # First run with args, or explicit --store: save them
+        $mstats->{llama_args} = $llama_args;
+        @final_llama_args = @$llama_args;
+        $stats_dirty = 1;
+        say "${gre}Stored model-specific args.$rst" if $verbose;
+    } elsif ($mstats->{llama_args}) {
+        # Use stored args
+        @final_llama_args = @{$mstats->{llama_args}};
+        say "${gre}Using stored model-specific args.$rst" if $verbose;
+        if (@$llama_args && !$opts->{store}) {
+            say "${yel}Note: New args provided but not stored. Use --store to update.$rst";
+        }
+    } else {
+        # No stored args, use what was provided (if any)
+        @final_llama_args = @$llama_args;
+    }
+    
+    # Prepend global args from config
+    my @global_args = @{$config->{global_llama_args} // []};
+    unshift @final_llama_args, @global_args;
+    
     # Check if already running with same args
     my $pid_file = get_pid_file($config, $opts->{port});
     if (-f $pid_file) {
         my $running = read_pid_file($pid_file);
         if ($running && process_exists($running->{pid})) {
-            my $args_hash = md5_hex(join('|', @$llama_args));
+            my $args_hash = md5_hex(join('|', @final_llama_args));
             if ($running->{model} eq $model_info->{path} && 
                 $running->{args_hash} eq $args_hash) {
                 say "${gre}Model already running on port $$opts{port} with same args.$rst";
@@ -107,10 +136,6 @@ sub main {
     }
     
     # Update stats for this model
-    my $model_key = basename($model_info->{path});
-    $stats->{$model_key} //= {};
-    my $mstats = $stats->{$model_key};
-    
     $mstats->{path} = $model_info->{path};
     $mstats->{total_uses} //= 0;
     $mstats->{total_uses}++;
@@ -134,7 +159,7 @@ sub main {
     }
     
     # Start llama-server
-    start_server($config, $opts, $model_info, $llama_args);
+    start_server($config, $opts, $model_info, \@final_llama_args);
 }
 
 sub usage {
@@ -147,7 +172,11 @@ sub usage {
 		  --kill / -k          Kill running model(s)
 		  --all                Kill ALL llama-pack managed servers
 		  --port N / -p N      Port on which to run server ($def_port)
+		  --store / --keep     Store model-specific args (updates existing)
 		  --verbose / -v -v    Incremental verbosity
+		  
+		  --                   Separates our options from model-specific llama-server args
+		  
 		Config:
 		 $config_file
 		EOT
@@ -160,11 +189,24 @@ sub parse_args {
         update => 0,
         kill => 0,
         kill_all => 0,
+        store => 0,
     );
     my @llama_args;
+    my $in_llama_args = 0;
     
     while (@ARGV) {
         my $arg = shift @ARGV;
+        
+        # -- separator means everything after goes to llama-server
+        if ($arg eq '--') {
+            $in_llama_args = 1;
+            next;
+        }
+        
+        if ($in_llama_args) {
+            push @llama_args, $arg;
+            next;
+        }
         
         if ($arg eq '-h' || $arg eq '--help') {
         	usage(); exit;
@@ -181,7 +223,9 @@ sub parse_args {
         } elsif ($arg eq '-p' || $arg eq '--port') {
             my $port = shift @ARGV;
             $opts{port} = $port;
-            push @llama_args, $arg, $port;
+            push @llama_args, '--port', $port;
+        } elsif ($arg eq '--store' || $arg eq '--keep') {
+            $opts{store} = 1;
         } elsif ($arg eq '-v' || $arg eq '--verbose') {
             $verbose++;
         } else {
@@ -223,6 +267,13 @@ sub load_config {
         default_port => $def_port,
         stats_file => "$config_dir/stats.json",
         pid_dir => '/tmp/llama-serve',
+        global_llama_args => [
+            '--flash-attn',
+            '-ngl', '80',
+            '-c', '15000',
+            '--jinja',
+            '--reranking',
+        ],
     };
     
     open my $fh, '>', $config_file or die "Can't write config: $!";
