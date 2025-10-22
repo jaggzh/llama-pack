@@ -14,6 +14,7 @@ no warnings 'once';
 use Text::Table;
 
 my $def_port = 8080;
+my $def_host = 127.0.0.1;
 my $config_dir = $ENV{HOME} . '/.config/llama-serve';
 my $config_file = "$config_dir/config.json";
 
@@ -50,6 +51,11 @@ sub main {
     # Handle commands that don't need model loading
     if ($opts->{list}) {
         list_models($config);
+        exit 0;
+    }
+    
+    if ($opts->{status}) {
+        show_status($config);
         exit 0;
     }
     
@@ -125,7 +131,7 @@ sub main {
             my $args_hash = md5_hex(join('|', @final_llama_args));
             if ($running->{model} eq $model_info->{path} && 
                 $running->{args_hash} eq $args_hash) {
-                say "${gre}Model already running on port $$opts{port} with same args.$rst";
+                say "${gre}Model already running on host:port $$opts{host}:$$opts{port} with same args.$rst";
                 exit 0;
             } else {
                 say "${yel}Killing existing server to reload with different model/args...$rst";
@@ -171,7 +177,9 @@ sub usage {
 		  --update / -u        Update list from files
 		  --kill / -k          Kill running model(s)
 		  --all                Kill ALL llama-pack managed servers
+		  --status / --stat / --st  Show running servers
 		  --port N / -p N      Port on which to run server ($def_port)
+		  --host S / -h s      Host ($def_host). 0.0.0.0 for all interfaces)
 		  --store / --keep     Store model-specific args (updates existing)
 		  --verbose / -v -v    Incremental verbosity
 		  
@@ -185,11 +193,13 @@ sub usage {
 sub parse_args {
     my %opts = (
         port => $def_port,
+        host => $def_host,
         list => 0,
         update => 0,
         kill => 0,
         kill_all => 0,
         store => 0,
+        status => 0,
     );
     my @llama_args;
     my $in_llama_args = 0;
@@ -220,6 +230,12 @@ sub parse_args {
             $opts{kill} = 1;
         } elsif ($arg eq '--all') {
             $opts{kill_all} = 1;
+        } elsif ($arg eq '--status' || $arg eq '--stat' || $arg eq '--st') {
+            $opts{status} = 1;
+        } elsif ($arg eq '-h' || $arg eq '--host') {
+            my $host = shift @ARGV;
+            $opts{host} = $host;
+            push @llama_args, '--host', $host;
         } elsif ($arg eq '-p' || $arg eq '--port') {
             my $port = shift @ARGV;
             $opts{port} = $port;
@@ -265,6 +281,7 @@ sub load_config {
         ssd_min_free_gb => 30,
         server_binary => 'llama-server',
         default_port => $def_port,
+        default_host => $def_host,
         stats_file => "$config_dir/stats.json",
         pid_dir => '/tmp/llama-serve',
         global_llama_args => [
@@ -277,11 +294,50 @@ sub load_config {
     };
     
     open my $fh, '>', $config_file or die "Can't write config: $!";
-    print $fh JSON::PP->new->pretty->encode($config);
+    my $json_text = JSON::PP->new->pretty->canonical->encode($config);
+    
+    # Add helpful comments
+    my $commented = <<~'EOT';
+		{
+		  // Paths to model directories
+		  "ssd_path" : "$HOME/models/ssd",
+		  "hdd_path" : "$HOME/models/hdd",
+		  
+		  // Minimum free space to maintain on SSD (GB)
+		  "ssd_min_free_gb" : 30,
+		  
+		  // llama.cpp server binary name/path
+		  "server_binary" : "llama-server",
+		  
+		  // Default host for server (0.0.0.0 for all interfaces)
+		  "default_host" : 127.0.0.1,
+		  
+		  // Default port for server
+		  "default_port" : 8080,
+		  
+		  // Internal files
+		  "stats_file" : "$config_dir/stats.json",
+		  "pid_dir" : "/tmp/llama-serve",
+		  
+		  // Global args passed to ALL models (customize these!)
+		  "global_llama_args" : [
+		    "--flash-attn",
+		    "-ngl", "80",
+		    "-c", "15000",
+		    "--jinja",
+		    "--reranking"
+		  ]
+		}
+		EOT
+    
+    $commented =~ s/\$HOME/$ENV{HOME}/g;
+    $commented =~ s/\$config_dir/$config_dir/g;
+    
+    print $fh $commented;
     close $fh;
     
-    say "${yel}Created default config at: $config_file$rst";
-    say "${yel}Edit paths before running with a model.$rst";
+    say "${gre}Created default config at: $config_file$rst";
+    say "${yel}Edit global_llama_args and paths to customize.$rst";
     
     return $config;
 }
@@ -567,28 +623,120 @@ sub kill_instances {
     my ($config, $opts) = @_;
     
     my $pid_dir = $config->{pid_dir};
-    return unless -d $pid_dir;
+    unless (-d $pid_dir) {
+        say "${yel}No PID directory found at: $pid_dir$rst";
+        return;
+    }
     
-    opendir my $dh, $pid_dir or return;
+    opendir my $dh, $pid_dir or do {
+        say "${red}Can't open PID directory: $!$rst";
+        return;
+    };
     my @pid_files = grep { /\.pid$/ } readdir($dh);
     closedir $dh;
     
+    unless (@pid_files) {
+        say "${yel}No running servers found.$rst";
+        return;
+    }
+    
+    say "${whi}Looking for running servers...$rst" if $verbose;
+    
+    my $killed_count = 0;
     for my $file (@pid_files) {
-        next if $opts->{port} && $file ne "port-$$opts{port}.pid";
+        # Skip if port specified and doesn't match
+        if ($opts->{port} && !$opts->{kill_all} && $file ne "port-$$opts{port}.pid") {
+            say "${gra}Skipping $file (port mismatch)$rst" if $verbose >= 2;
+            next;
+        }
         
         my $full = "$pid_dir/$file";
         my $running = read_pid_file($full);
         
-        if ($running && process_exists($running->{pid})) {
-            say "${yel}Killing PID $$running{pid} on port $$running{port}$rst";
+        unless ($running) {
+            say "${gra}Removing stale PID file: $file$rst" if $verbose >= 2;
+            unlink $full;
+            next;
+        }
+        
+        if (process_exists($running->{pid})) {
+            my $model_name = basename($running->{model});
+            say "${yel}Killing PID $$running{pid} on port $$running{port} ($model_name)$rst";
             kill_pid($running->{pid});
             unlink $full;
+            $killed_count++;
         } else {
-            unlink $full;  # Stale PID file
+            say "${gra}Removing stale PID file: $file (process $$running{pid} not running)$rst" if $verbose;
+            unlink $full;
         }
         
         last unless $opts->{kill_all};
     }
+
+    if ($killed_count == 0) {
+        say "${yel}No running servers found to kill.$rst";
+    } else {
+        say "${gre}Killed $killed_count server(s).$rst";
+    }
+}
+
+sub show_status {
+    my $config = shift;
+    my $pid_dir = $config->{pid_dir};
+    
+    unless (-d $pid_dir) {
+        say "${yel}No PID directory found. No servers running.$rst";
+        return;
+    }
+    
+    opendir my $dh, $pid_dir or do {
+        say "${red}Can't open PID directory: $!$rst";
+        return;
+    };
+    my @pid_files = grep { /\.pid$/ } readdir($dh);
+    closedir $dh;
+    
+    unless (@pid_files) {
+        say "${yel}No running servers.$rst";
+        return;
+    }
+    
+    say "${whi}${inv} Running Servers $rst\n";
+    
+    my $tb = Text::Table->new(
+        { title => "Port", align => 'right' },
+        \"  ",
+        { title => "PID", align => 'right' },
+        \"  ",
+        { title => "Model", align => 'left' },
+        \"  ",
+        { title => "Status", align => 'left' },
+    );
+    
+    my $active_count = 0;
+    for my $file (sort @pid_files) {
+        my $full = "$pid_dir/$file";
+        my $running = read_pid_file($full);
+        
+        unless ($running) {
+            next;  # Skip malformed files
+        }
+        
+        my $model_name = basename($running->{model});
+        my $status;
+        
+        if (process_exists($running->{pid})) {
+            $status = "${gre}RUNNING$rst";
+            $active_count++;
+        } else {
+            $status = "${gra}STALE$rst";
+        }
+        
+        $tb->add($running->{port}, $running->{pid}, "$cya$model_name$rst", $status);
+    }
+    
+    print $tb;
+    say "\n${gre}Active servers: $active_count$rst";
 }
 
 sub update_current_runtime {
