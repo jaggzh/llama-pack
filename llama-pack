@@ -146,7 +146,7 @@ sub usage {
 		  --update / -u        Update list from files
 		  --kill / -k          Kill running model(s)
 		  --all                Kill ALL llama-pack managed servers
-		  --port N             Port on which to run server ($def_port)
+		  --port N / -p N      Port on which to run server ($def_port)
 		  --verbose / -v -v    Incremental verbosity
 		Config:
 		 $config_file
@@ -178,7 +178,7 @@ sub parse_args {
             $opts{kill} = 1;
         } elsif ($arg eq '--all') {
             $opts{kill_all} = 1;
-        } elsif ($arg eq '--port') {
+        } elsif ($arg eq '-p' || $arg eq '--port') {
             my $port = shift @ARGV;
             $opts{port} = $port;
             push @llama_args, $arg, $port;
@@ -210,6 +210,7 @@ sub load_config {
         $config->{ssd_path} = glob $config->{ssd_path} if $config->{ssd_path}//0;
         $config->{pid_dir} = glob $config->{pid_dir} if $config->{pid_dir}//0;
         $config->{pid_dir} //= '/tmp/llama-serve';
+        $config->{server_binary} = glob $config->{server_binary} if $config->{server_binary}//'llama-server';
         return $config;
     }
     
@@ -266,20 +267,33 @@ sub scan_models {
     my $config = shift;
     my $stats = load_stats($config);
     
-    for my $location (qw(hdd ssd)) {
+    # Clear existing locations to rescan
+    for my $key (keys %$stats) {
+        $stats->{$key}{locations} = [];
+    }
+    
+    for my $location (qw(ssd hdd)) {
         my $path = $config->{"${location}_path"};
         next unless -d $path;
         
         find(sub {
             return unless -f && /\.gguf$/i;
             my $full_path = $File::Find::name;
-            say "$full_path";
+            say "$full_path" if $verbose;
             my $key = basename($full_path);
             
             $stats->{$key} //= {};
-            $stats->{$key}{path} = $full_path;
             $stats->{$key}{locations} //= [];
-            push @$stats->{$key}{locations}, $location;
+            
+            # Only add if not already present
+            push @{$stats->{$key}{locations}}, $location
+                unless grep { $_ eq $location } @{$stats->{$key}{locations}};
+            
+            # Update path to prefer SSD
+            if ($location eq 'ssd' || !$stats->{$key}{path}) {
+                $stats->{$key}{path} = $full_path;
+            }
+            
             $stats->{$key}{size_bytes} = -s $full_path;
             $stats->{$key}{mtime} = (stat($full_path))[9];
             
@@ -305,9 +319,12 @@ sub find_model {
     
     # Try exact match first
     if ($stats->{$model_name}) {
+        my $locs = $stats->{$model_name}{locations} // [];
+        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
         return {
             path => $stats->{$model_name}{path},
-            location => $stats->{$model_name}{location} // 'unknown',
+            location => $preferred,
+            locations => $locs,
         };
     }
     
@@ -321,9 +338,12 @@ sub find_model {
         return undef;
     } elsif (@matches == 1) {
         my $key = $matches[0];
+        my $locs = $stats->{$key}{locations} // [];
+        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
         return {
             path => $stats->{$key}{path},
-            location => $stats->{$key}{location} // 'unknown',
+            location => $preferred,
+            locations => $locs,
         };
     } else {
         # Multiple matches - pick highest ranked
@@ -341,9 +361,12 @@ sub find_model {
         my $chosen = $ranked[-1];  # Highest rank is at end now
         say "${gre}Using highest-ranked: $chosen$rst";
         
+        my $locs = $stats->{$chosen}{locations} // [];
+        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
         return {
             path => $stats->{$chosen}{path},
-            location => $stats->{$chosen}{location} // 'unknown',
+            location => $preferred,
+            locations => $locs,
         };
     }
 }
@@ -553,26 +576,26 @@ sub list_models {
 		{ title => "Model", align => 'left' },
 		{ title => "Rank", align => 'point', align_title => 'center'  },
 		{ title => "Uses", align => 'right', align_title => 'right' },
-		# { is_sep=>1, body=>'  ', },
 		\"  ",
 		{ title => "Loc", align => 'left' },
 		{ title => "Last", align => 'left' },
 	);
-
     for my $model (@models) {
         my $mstats = $stats->{$model};
         my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
         my $uses = $mstats->{total_uses} // 0;
-        my $loc = $mstats->{location} // '?';
+        my $locs = $mstats->{locations} // [];
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
         
-        my $loc_color = $loc eq 'ssd' ? $gre : $yel;
+        # Build location display: SSD (bright cyan) first, then HDD (yellow)
+        my @loc_display;
+        push @loc_display, "${bcya}SSD${rst}" if grep { $_ eq 'ssd' } @$locs;
+        push @loc_display, "${yel}HDD${rst}" if grep { $_ eq 'hdd' } @$locs;
+        my $loc_str = @loc_display ? join(' ', @loc_display) : '?';
         
         # printf "%s%-40s$rst  rank:%6s  uses:%3d  loc:%s%-3s$rst  last:%s\n",
         #     $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
-        $tb->add("$cya$model$rst", $rank, $uses,
-        	$loc_color . uc($loc) . $rst,
-        	$last);
+        $tb->add("$cya$model$rst", $rank, $uses, $loc_str, $last);
     }
     print $tb;
 }
