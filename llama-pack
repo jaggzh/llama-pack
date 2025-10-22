@@ -13,6 +13,10 @@ use Fcntl qw(:flock);
 no warnings 'once';
 use Text::Table;
 
+my $def_port = 8080;
+my $config_dir = $ENV{HOME} . '/.config/llama-serve';
+my $config_file = "$config_dir/config.json";
+
 # bansi color exports
 our ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra);
 our ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra);
@@ -133,9 +137,25 @@ sub main {
     start_server($config, $opts, $model_info, $llama_args);
 }
 
+sub usage {
+	print <<~EOT;
+		llama-pack: Manage and load LLM models and their faster access stored on SSD.
+		Options:
+		  --model / -m name    Name or pattern
+		  --list / -l          List models/info
+		  --update / -u        Update list from files
+		  --kill / -k          Kill running model(s)
+		  --all                Kill ALL llama-pack managed servers
+		  --port N             Port on which to run server ($def_port)
+		  --verbose / -v -v    Incremental verbosity
+		Config:
+		 $config_file
+		EOT
+}
+
 sub parse_args {
     my %opts = (
-        port => 8080,
+        port => $def_port,
         list => 0,
         update => 0,
         kill => 0,
@@ -146,11 +166,13 @@ sub parse_args {
     while (@ARGV) {
         my $arg = shift @ARGV;
         
-        if ($arg eq '-m' || $arg eq '--model') {
+        if ($arg eq '-h' || $arg eq '--help') {
+        	usage(); exit;
+		} elsif ($arg eq '-m' || $arg eq '--model') {
             $opts{model} = shift @ARGV;
         } elsif ($arg eq '-l' || $arg eq '--list') {
             $opts{list} = 1;
-        } elsif ($arg eq '--update') {
+        } elsif ($arg eq '-u' || $arg eq '--update') {
             $opts{update} = 1;
         } elsif ($arg eq '-k' || $arg eq '--kill') {
             $opts{kill} = 1;
@@ -171,9 +193,6 @@ sub parse_args {
 }
 
 sub load_config {
-    my $config_dir = $ENV{HOME} . '/.config/llama-serve';
-    my $config_file = "$config_dir/config.json";
-    
     make_path($config_dir) unless -d $config_dir;
     
     if (-f $config_file) {
@@ -200,7 +219,7 @@ sub load_config {
         hdd_path => "$ENV{HOME}/models/hdd",
         ssd_min_free_gb => 30,
         server_binary => 'llama-server',
-        default_port => 8080,
+        default_port => $def_port,
         stats_file => "$config_dir/stats.json",
         pid_dir => '/tmp/llama-serve',
     };
@@ -247,19 +266,20 @@ sub scan_models {
     my $config = shift;
     my $stats = load_stats($config);
     
-    for my $location (qw(ssd hdd)) {
-        $DB::single=1;
+    for my $location (qw(hdd ssd)) {
         my $path = $config->{"${location}_path"};
         next unless -d $path;
         
         find(sub {
             return unless -f && /\.gguf$/i;
             my $full_path = $File::Find::name;
+            say "$full_path";
             my $key = basename($full_path);
             
             $stats->{$key} //= {};
             $stats->{$key}{path} = $full_path;
-            $stats->{$key}{location} = $location;
+            $stats->{$key}{locations} //= [];
+            push @$stats->{$key}{locations}, $location;
             $stats->{$key}{size_bytes} = -s $full_path;
             $stats->{$key}{mtime} = (stat($full_path))[9];
             
