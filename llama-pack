@@ -1,8 +1,8 @@
-#!/usr/bin/env perl
+#!/usr/bin/perl
 BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
 
 use v5.36;
-use JSON::PP;
+use JSON::XS;
 use File::Find;
 use File::Path qw(make_path);
 use File::Copy;
@@ -12,6 +12,7 @@ use Time::Piece;
 use Fcntl qw(:flock);
 no warnings 'once';
 use Text::Table;
+use utf8;
 
 my $def_port = 8080;
 my $def_host = 127.0.0.1;
@@ -44,61 +45,79 @@ main();
 
 sub main {
     my $config = load_config();
-    
+
     # Parse our args vs llama-server args
     my ($opts, $llama_args) = parse_args();
-    
+
+    # Apply config defaults if not specified on command line
+    $opts->{port} //= $config->{default_port} // $def_port;
+    $opts->{host} //= $config->{default_host} // $def_host;
+
+    # Add host/port to llama_args if they weren't already added
+    my $has_port = grep { $_ eq '--port' } @$llama_args;
+    my $has_host = grep { $_ eq '--host' } @$llama_args;
+
+    push @$llama_args, '--port', $opts->{port} unless $has_port;
+    push @$llama_args, '--host', $opts->{host} unless $has_host;
+
     # Handle commands that don't need model loading
     if ($opts->{list}) {
         list_models($config);
         exit 0;
     }
-    
+
     if ($opts->{status}) {
         show_status($config);
         exit 0;
     }
-    
+
     if ($opts->{update}) {
         scan_models($config);
         say "${gre}Model index updated.$rst";
         exit 0;
     }
-    
-    if ($opts->{kill}) {
+
+    # If -k without model, just kill
+    if ($opts->{kill} && !$opts->{model}) {
         kill_instances($config, $opts);
         exit 0;
     }
-    
+
+    # If -k WITH model, kill first then continue to load model
+    if ($opts->{kill} && $opts->{model}) {
+        say "${yel}Killing existing server(s) before loading model...$rst" if $verbose;
+        kill_instances($config, $opts);
+    }
+
     # Need a model to proceed
     unless ($opts->{model}) {
         serr(0, "No model specified. Use -m or --model");
         exit 1;
     }
-    
+
     # Auto-scan on first run if no stats file exists
     unless (-f $config->{stats_file}) {
         say "${yel}First run detected. Scanning for models...$rst";
         scan_models($config);
     }
-    
+
     # Load stats
     my $stats = load_stats($config);
-    
+
     # Find the model
     my $model_info = find_model($config, $stats, $opts->{model});
     unless ($model_info) {
         serr(0, "Model '$$opts{model}' not found.");
         exit 1;
     }
-    
+
     say "${gre}Found model: $$model_info{path}$rst" if $verbose;
-    
+
     # Handle model-specific args
     my $model_key = basename($model_info->{path});
     $stats->{$model_key} //= {};
     my $mstats = $stats->{$model_key};
-    
+
     # Determine which args to use
     my @final_llama_args;
     if (@$llama_args && (!$mstats->{llama_args} || $opts->{store})) {
@@ -118,18 +137,18 @@ sub main {
         # No stored args, use what was provided (if any)
         @final_llama_args = @$llama_args;
     }
-    
+
     # Prepend global args from config
     my @global_args = @{$config->{global_llama_args} // []};
     unshift @final_llama_args, @global_args;
-    
+
     # Check if already running with same args
     my $pid_file = get_pid_file($config, $opts->{port});
     if (-f $pid_file) {
         my $running = read_pid_file($pid_file);
         if ($running && process_exists($running->{pid})) {
             my $args_hash = md5_hex(join('|', @final_llama_args));
-            if ($running->{model} eq $model_info->{path} && 
+            if ($running->{model} eq $model_info->{path} &&
                 $running->{args_hash} eq $args_hash) {
                 say "${gre}Model already running on host:port $$opts{host}:$$opts{port} with same args.$rst";
                 exit 0;
@@ -140,7 +159,7 @@ sub main {
             }
         }
     }
-    
+
     # Update stats for this model
     $mstats->{path} = $model_info->{path};
     $mstats->{total_uses} //= 0;
@@ -148,52 +167,67 @@ sub main {
     $mstats->{last_used} = gmtime->datetime;
     $mstats->{use_timestamps} //= [];
     push @{$mstats->{use_timestamps}}, gmtime->datetime;
-    
+
     # Keep only last 100 timestamps to prevent bloat
     if (@{$mstats->{use_timestamps}} > 100) {
         $mstats->{use_timestamps} = [
             @{$mstats->{use_timestamps}}[-100..-1]
         ];
     }
-    
+
     $stats_dirty = 1;
-    
+
     # Should we cache to SSD?
     if ($model_info->{location} eq 'hdd' && should_cache_to_ssd($mstats)) {
         say "${yel}Model used multiple times recently. Caching to SSD...$rst";
         fork_ssd_copy($config, $model_info, $stats);
     }
-    
+
     # Start llama-server
     start_server($config, $opts, $model_info, \@final_llama_args);
 }
 
 sub usage {
 	print <<~EOT;
-		llama-pack: Manage and load LLM models and their faster access stored on SSD.
-		Options:
-		  --model / -m name    Name or pattern
-		  --list / -l          List models/info
-		  --update / -u        Update list from files
-		  --kill / -k          Kill running model(s)
-		  --all                Kill ALL llama-pack managed servers
-		  --status / --stat / --st  Show running servers
-		  --port N / -p N      Port on which to run server ($def_port)
-		  --host S / -h s      Host ($def_host). 0.0.0.0 for all interfaces)
-		  --store / --keep     Store model-specific args (updates existing)
-		  --verbose / -v -v    Incremental verbosity
-		  
-		  --                   Separates our options from model-specific llama-server args
-		  
-		Config:
-		 $config_file
+		llama-pack: Manage and load LLM models with smart SSD caching.
+
+		RUNNING MODELS:
+		  -m, --model NAME     Load model by name/pattern
+		  -p, --port N         Server port (default: $def_port)
+		  --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
+		  --store, --keep      Save model-specific args for future runs
+
+		MANAGING MODELS:
+		  -l, --list           List all models with stats and rankings
+		  -u, --update         Scan directories and update model index
+		  --status, --stat     Show currently running servers
+		  --st
+
+		KILLING SERVERS:
+		  -k, --kill           Kill server on specified port (use with -p/--port)
+		  --killall, --kall    Kill ALL llama-pack managed servers
+
+		OTHER:
+		  -v, --verbose        Increase verbosity (use multiple times: -v -v)
+		  -h, --help           This help
+		  --                   Everything after this goes to llama-server
+
+		EXAMPLES:
+		  llama-pack -m mymodel                    # Load model with saved args
+		  llama-pack -m mymodel -- -c 8192         # Override context size once
+		  llama-pack -m mymodel --store -- -c 8192 # Save new context size
+		  llama-pack -k -p 8080                    # Kill server on port 8080
+		  llama-pack --killall                     # Kill all running servers
+		  llama-pack --status                      # Show what's running
+
+		CONFIG: $config_file
 		EOT
 }
 
 sub parse_args {
     my %opts = (
-        port => $def_port,
-        host => $def_host,
+        port => undef,  # set from config if not specified
+        host => undef,  # set from config if not specified
         list => 0,
         update => 0,
         kill => 0,
@@ -203,21 +237,21 @@ sub parse_args {
     );
     my @llama_args;
     my $in_llama_args = 0;
-    
+
     while (@ARGV) {
         my $arg = shift @ARGV;
-        
+
         # -- separator means everything after goes to llama-server
         if ($arg eq '--') {
             $in_llama_args = 1;
             next;
         }
-        
+
         if ($in_llama_args) {
             push @llama_args, $arg;
             next;
         }
-        
+
         if ($arg eq '-h' || $arg eq '--help') {
         	usage(); exit;
 		} elsif ($arg eq '-m' || $arg eq '--model') {
@@ -228,18 +262,17 @@ sub parse_args {
             $opts{update} = 1;
         } elsif ($arg eq '-k' || $arg eq '--kill') {
             $opts{kill} = 1;
-        } elsif ($arg eq '--all') {
+        } elsif ($arg eq '--killall' || $arg eq '--kall') {
             $opts{kill_all} = 1;
+            $opts{kill} = 1;
         } elsif ($arg eq '--status' || $arg eq '--stat' || $arg eq '--st') {
             $opts{status} = 1;
-        } elsif ($arg eq '-h' || $arg eq '--host') {
+        } elsif ($arg eq '--host') {
             my $host = shift @ARGV;
             $opts{host} = $host;
-            push @llama_args, '--host', $host;
         } elsif ($arg eq '-p' || $arg eq '--port') {
             my $port = shift @ARGV;
             $opts{port} = $port;
-            push @llama_args, '--port', $port;
         } elsif ($arg eq '--store' || $arg eq '--keep') {
             $opts{store} = 1;
         } elsif ($arg eq '-v' || $arg eq '--verbose') {
@@ -248,21 +281,21 @@ sub parse_args {
             push @llama_args, $arg;
         }
     }
-    
+
     return (\%opts, \@llama_args);
 }
 
 sub load_config {
     make_path($config_dir) unless -d $config_dir;
-    
+
     if (-f $config_file) {
         open my $fh, '<', $config_file or die "Can't read config: $!";
         my $json = do { local $/; <$fh> };
         close $fh;
-        
+
         # Remove // comments
         $json =~ s|//.*$||gm;
-        
+
         my $config = decode_json($json);
         $config->{stats_file} = glob $config->{stats_file} if $config->{stats_file}//0;
         $config->{stats_file} //= "$config_dir/stats.json";
@@ -273,7 +306,7 @@ sub load_config {
         $config->{server_binary} = glob $config->{server_binary} if $config->{server_binary}//'llama-server';
         return $config;
     }
-    
+
     # Create default config
     my $config = {
         ssd_path => "$ENV{HOME}/models/ssd",
@@ -292,33 +325,33 @@ sub load_config {
             '--reranking',
         ],
     };
-    
+
     open my $fh, '>', $config_file or die "Can't write config: $!";
-    my $json_text = JSON::PP->new->pretty->canonical->encode($config);
-    
+    my $json_text = JSON::XS->new->pretty->canonical->encode($config);
+
     # Add helpful comments
     my $commented = <<~'EOT';
 		{
 		  // Paths to model directories
 		  "ssd_path" : "$HOME/models/ssd",
 		  "hdd_path" : "$HOME/models/hdd",
-		  
+
 		  // Minimum free space to maintain on SSD (GB)
 		  "ssd_min_free_gb" : 30,
-		  
+
 		  // llama.cpp server binary name/path
 		  "server_binary" : "llama-server",
-		  
+
 		  // Default host for server (0.0.0.0 for all interfaces)
 		  "default_host" : 127.0.0.1,
-		  
+
 		  // Default port for server
 		  "default_port" : 8080,
-		  
+
 		  // Internal files
 		  "stats_file" : "$config_dir/stats.json",
 		  "pid_dir" : "/tmp/llama-serve",
-		  
+
 		  // Global args passed to ALL models (customize these!)
 		  "global_llama_args" : [
 		    "--flash-attn",
@@ -329,93 +362,96 @@ sub load_config {
 		  ]
 		}
 		EOT
-    
+
     $commented =~ s/\$HOME/$ENV{HOME}/g;
     $commented =~ s/\$config_dir/$config_dir/g;
-    
+
     print $fh $commented;
     close $fh;
-    
+
     say "${gre}Created default config at: $config_file$rst";
     say "${yel}Edit global_llama_args and paths to customize.$rst";
-    
+
     return $config;
 }
 
 sub load_stats {
     my $config = shift;
     my $file = $config->{stats_file};
-    
+
     return {} unless -f $file;
-    
+
     open my $fh, '<', $file or return {};
     my $json = do { local $/; <$fh> };
     close $fh;
-    
-    return decode_json($json);
+    if ($json !~ /\S/) {
+    	return {}
+	} else {
+		return decode_json($json);
+	}
 }
 
 sub write_stats {
     my $config = load_config();
     my $stats = load_stats($config);
-    
+
     open my $fh, '>', $config->{stats_file} or do {
         serr(0, "Can't write stats: $!");
         return;
     };
-    
-    print $fh JSON::PP->new->pretty->encode($stats);
+
+    print $fh JSON::XS->new->pretty->encode($stats);
     close $fh;
-    
+
     $stats_dirty = 0;
 }
 
 sub scan_models {
     my $config = shift;
     my $stats = load_stats($config);
-    
+
     # Clear existing locations to rescan
     for my $key (keys %$stats) {
         $stats->{$key}{locations} = [];
     }
-    
+
     for my $location (qw(ssd hdd)) {
         my $path = $config->{"${location}_path"};
         next unless -d $path;
-        
+
         find(sub {
             return unless -f && /\.gguf$/i;
             my $full_path = $File::Find::name;
             say "$full_path" if $verbose;
             my $key = basename($full_path);
-            
+
             $stats->{$key} //= {};
             $stats->{$key}{locations} //= [];
-            
+
             # Only add if not already present
             push @{$stats->{$key}{locations}}, $location
                 unless grep { $_ eq $location } @{$stats->{$key}{locations}};
-            
+
             # Update path to prefer SSD
             if ($location eq 'ssd' || !$stats->{$key}{path}) {
                 $stats->{$key}{path} = $full_path;
             }
-            
+
             $stats->{$key}{size_bytes} = -s $full_path;
             $stats->{$key}{mtime} = (stat($full_path))[9];
-            
+
         }, $path);
     }
-    
+
     # Write updated stats
     open my $fh, '>', $config->{stats_file} or die "Can't write stats ($config->{stats_file}): $!";
-    print $fh JSON::PP->new->pretty->encode($stats);
+    print $fh JSON::XS->new->pretty->encode($stats);
     close $fh;
 }
 
 sub find_model {
     my ($config, $stats, $model_name) = @_;
-    
+
     # Calculate mtime range for ranking
     my ($newest_mtime, $oldest_mtime) = (0, time);
     for my $model (keys %$stats) {
@@ -423,7 +459,7 @@ sub find_model {
         $newest_mtime = $mtime if $mtime > $newest_mtime;
         $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
     }
-    
+
     # Try exact match first
     if ($stats->{$model_name}) {
         my $locs = $stats->{$model_name}{locations} // [];
@@ -434,13 +470,13 @@ sub find_model {
             locations => $locs,
         };
     }
-    
+
     # Try substring match
     my @matches;
     for my $key (keys %$stats) {
         push @matches, $key if $key =~ /\Q$model_name\E/i;
     }
-    
+
     if (@matches == 0) {
         return undef;
     } elsif (@matches == 1) {
@@ -455,19 +491,19 @@ sub find_model {
     } else {
         # Multiple matches - pick highest ranked
         say "${yel}Multiple models found matching '$model_name':$rst";
-        my @ranked = sort { 
-            rank_model($stats->{$b}, $newest_mtime, $oldest_mtime) <=> 
-            rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) 
+        my @ranked = sort {
+            rank_model($stats->{$b}, $newest_mtime, $oldest_mtime) <=>
+            rank_model($stats->{$a}, $newest_mtime, $oldest_mtime)
         } @matches;
-        
+
         for my $m (@ranked) {
             my $rank = sprintf("%.1f", rank_model($stats->{$m}, $newest_mtime, $oldest_mtime));
             say "  $m (rank: $rank)";
         }
-        
+
         my $chosen = $ranked[-1];  # Highest rank is at end now
         say "${gre}Using highest-ranked: $chosen$rst";
-        
+
         my $locs = $stats->{$chosen}{locations} // [];
         my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
         return {
@@ -480,11 +516,11 @@ sub find_model {
 
 sub rank_model {
     my ($mstats, $newest_mtime, $oldest_mtime) = @_;
-    
+
     my $total_uses = $mstats->{total_uses} // 0;
     my $last_used = $mstats->{last_used};
     my $days_since = $last_used ? days_ago($last_used) : 999;
-    
+
     # File mtime bonus: normalize file age to 0-1 range, scale to small bonus
     my $mtime_bonus = 0;
     if ($mstats->{mtime} && $newest_mtime && $oldest_mtime && $newest_mtime != $oldest_mtime) {
@@ -492,7 +528,7 @@ sub rank_model {
         my $normalized = ($mstats->{mtime} - $oldest_mtime) / ($newest_mtime - $oldest_mtime);
         $mtime_bonus = $normalized * 0.5;
     }
-    
+
     # Simple ranking: recent use matters most, slight nudge for new files
     return $total_uses - ($days_since * 2) + $mtime_bonus;
 }
@@ -500,10 +536,10 @@ sub rank_model {
 sub days_ago {
     my $timestamp = shift;
     return 999 unless $timestamp;
-    
+
     my $then = eval { Time::Piece->strptime($timestamp, '%Y-%m-%dT%H:%M:%S') };
     return 999 unless $then;
-    
+
     my $diff = time - $then->epoch;
     return $diff / 86400;
 }
@@ -511,31 +547,31 @@ sub days_ago {
 sub should_cache_to_ssd {
     my $mstats = shift;
     my $timestamps = $mstats->{use_timestamps} // [];
-    
+
     my $count = 0;
     for my $ts (@$timestamps) {
         $count++ if days_ago($ts) < 1;
     }
-    
+
     return $count >= 2;
 }
 
 sub fork_ssd_copy {
     my ($config, $model_info, $stats) = @_;
-    
+
     my $pid = fork();
     if ($pid == 0) {
         # Child process
         my $src = $model_info->{path};
         my $dst = $config->{ssd_path} . '/' . basename($src);
-        
+
         say "${blu}[Background] Copying to SSD: $src -> $dst$rst" if $verbose;
-        
+
         copy($src, $dst) or do {
             serr(0, "[Background] Copy failed: $!");
             exit 1;
         };
-        
+
         say "${gre}[Background] Copy complete.$rst" if $verbose;
         exit 0;
     }
@@ -544,31 +580,60 @@ sub fork_ssd_copy {
 
 sub start_server {
     my ($config, $opts, $model_info, $llama_args) = @_;
-    
+
     my $binary = $config->{server_binary};
     my @cmd = ($binary, '-m', $model_info->{path}, @$llama_args);
-    
+
     say "${gre}Starting: " . join(' ', @cmd) . $rst if $verbose;
-    
+
+    # Write PID file BEFORE forking so we have the file reference
+    my $pid_file = get_pid_file($config, $opts->{port});
+
     # Fork server
     my $pid = fork();
     die "Fork failed: $!" unless defined $pid;
-    
+
     if ($pid == 0) {
         # Child - exec server
         exec(@cmd) or die "Exec failed: $!";
     }
-    
-    # Parent - write PID file and wait
+
+    # Parent - write PID file with child's PID and wait
     $current_runtime_start = time;
+    my $model_key = basename($model_info->{path});
     write_pid_file($config, $opts->{port}, $pid, $model_info->{path}, $llama_args);
-    
-    say "${gre}Server started (PID: $pid, Port: $$opts{port})$rst";
-    
-    # Wait for server
+
+    say "${gre}Server started (PID: $pid, Host:Port: $$opts{host}:$$opts{port})$rst";
+    say "${gre}PID file: $pid_file$rst" if $verbose;
+
+    # Wait for server - when it exits, update runtime stats
     waitpid($pid, 0);
-    
-    update_current_runtime();
+    my $exit_status = $? >> 8;
+
+    say "${yel}Server exited with status: $exit_status$rst" if $verbose;
+
+    # Update runtime stats
+    my $runtime_seconds = time - $current_runtime_start;
+    my $config_reload = load_config();
+    my $stats = load_stats($config_reload);
+
+    if ($stats->{$model_key}) {
+        $stats->{$model_key}{total_runtime_seconds} //= 0;
+        $stats->{$model_key}{total_runtime_seconds} += $runtime_seconds;
+        $stats->{$model_key}{last_runtime_seconds} = $runtime_seconds;
+
+        open my $fh, '>', $config_reload->{stats_file} or do {
+            serr(0, "Can't write stats after runtime: $!");
+        };
+        if ($fh) {
+            print $fh JSON::XS->new->pretty->encode($stats);
+            close $fh;
+            say "${gre}Runtime logged: ${runtime_seconds}s$rst" if $verbose;
+        }
+    }
+
+    # Clean up PID file on exit
+    unlink $pid_file if -f $pid_file;
 }
 
 sub get_pid_file {
@@ -580,10 +645,10 @@ sub get_pid_file {
 
 sub write_pid_file {
     my ($config, $port, $pid, $model, $llama_args) = @_;
-    
+
     my $file = get_pid_file($config, $port);
     my $args_hash = md5_hex(join('|', @$llama_args));
-    
+
     open my $fh, '>', $file or die "Can't write PID file: $!";
     print $fh "$pid|$port|$model|$args_hash\n";
     close $fh;
@@ -591,14 +656,14 @@ sub write_pid_file {
 
 sub read_pid_file {
     my $file = shift;
-    
+
     open my $fh, '<', $file or return undef;
     my $line = <$fh>;
     close $fh;
-    
+
     chomp $line;
     my ($pid, $port, $model, $args_hash) = split /\|/, $line;
-    
+
     return {
         pid => $pid,
         port => $port,
@@ -621,47 +686,48 @@ sub kill_pid {
 
 sub kill_instances {
     my ($config, $opts) = @_;
-    
+
     my $pid_dir = $config->{pid_dir};
     unless (-d $pid_dir) {
         say "${yel}No PID directory found at: $pid_dir$rst";
+        say "${gra}(No servers have been started yet)$rst";
         return;
     }
-    
+
     opendir my $dh, $pid_dir or do {
         say "${red}Can't open PID directory: $!$rst";
         return;
     };
     my @pid_files = grep { /\.pid$/ } readdir($dh);
     closedir $dh;
-    
+
     unless (@pid_files) {
         say "${yel}No running servers found.$rst";
         return;
     }
-    
-    say "${whi}Looking for running servers...$rst" if $verbose;
-    
+
+    say "${whi}Searching for servers to kill...$rst" if $verbose;
+
     my $killed_count = 0;
     for my $file (@pid_files) {
-        # Skip if port specified and doesn't match
+        # Skip if port specified and doesn't match (unless --killall)
         if ($opts->{port} && !$opts->{kill_all} && $file ne "port-$$opts{port}.pid") {
             say "${gra}Skipping $file (port mismatch)$rst" if $verbose >= 2;
             next;
         }
-        
+
         my $full = "$pid_dir/$file";
         my $running = read_pid_file($full);
-        
+
         unless ($running) {
-            say "${gra}Removing stale PID file: $file$rst" if $verbose >= 2;
+            say "${gra}Removing malformed PID file: $file$rst" if $verbose >= 2;
             unlink $full;
             next;
         }
-        
+
         if (process_exists($running->{pid})) {
             my $model_name = basename($running->{model});
-            say "${yel}Killing PID $$running{pid} on port $$running{port} ($model_name)$rst";
+            say "${yel}Killing: PID $$running{pid} on port $$running{port} ($model_name)$rst";
             kill_pid($running->{pid});
             unlink $full;
             $killed_count++;
@@ -669,40 +735,40 @@ sub kill_instances {
             say "${gra}Removing stale PID file: $file (process $$running{pid} not running)$rst" if $verbose;
             unlink $full;
         }
-        
+
         last unless $opts->{kill_all};
     }
 
     if ($killed_count == 0) {
-        say "${yel}No running servers found to kill.$rst";
+        say "${yel}No active servers found to kill.$rst";
     } else {
-        say "${gre}Killed $killed_count server(s).$rst";
+        say "${gre}Successfully killed $killed_count server(s).$rst";
     }
 }
 
 sub show_status {
     my $config = shift;
     my $pid_dir = $config->{pid_dir};
-    
+
     unless (-d $pid_dir) {
         say "${yel}No PID directory found. No servers running.$rst";
         return;
     }
-    
+
     opendir my $dh, $pid_dir or do {
         say "${red}Can't open PID directory: $!$rst";
         return;
     };
     my @pid_files = grep { /\.pid$/ } readdir($dh);
     closedir $dh;
-    
+
     unless (@pid_files) {
         say "${yel}No running servers.$rst";
         return;
     }
-    
+
     say "${whi}${inv} Running Servers $rst\n";
-    
+
     my $tb = Text::Table->new(
         { title => "Port", align => 'right' },
         \"  ",
@@ -712,50 +778,45 @@ sub show_status {
         \"  ",
         { title => "Status", align => 'left' },
     );
-    
+
     my $active_count = 0;
     for my $file (sort @pid_files) {
         my $full = "$pid_dir/$file";
         my $running = read_pid_file($full);
-        
+
         unless ($running) {
             next;  # Skip malformed files
         }
-        
+
         my $model_name = basename($running->{model});
         my $status;
-        
+
         if (process_exists($running->{pid})) {
             $status = "${gre}RUNNING$rst";
             $active_count++;
         } else {
             $status = "${gra}STALE$rst";
         }
-        
+
         $tb->add($running->{port}, $running->{pid}, "$cya$model_name$rst", $status);
     }
-    
+
     print $tb;
     say "\n${gre}Active servers: $active_count$rst";
 }
 
 sub update_current_runtime {
     return unless $current_runtime_start;
-    
-    my $config = load_config();
-    my $stats = load_stats($config);
-    
-    my $duration = time - $current_runtime_start;
-    
-    # Find current model from PID file
-    # For now, just mark stats dirty
+
+    # Runtime is now logged in start_server() when server exits
+    # This stub remains for signal handlers
     $stats_dirty = 1;
 }
 
 sub list_models {
     my $config = shift;
     my $stats = load_stats($config);
-    
+
     # Calculate mtime range for normalization
     my ($newest_mtime, $oldest_mtime) = (0, time);
     for my $model (keys %$stats) {
@@ -763,14 +824,14 @@ sub list_models {
         $newest_mtime = $mtime if $mtime > $newest_mtime;
         $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
     }
-    
-    my @models = sort { 
-        rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) <=> 
+
+    my @models = sort {
+        rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) <=>
         rank_model($stats->{$b}, $newest_mtime, $oldest_mtime)
     } keys %$stats;
-    
+
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
-    
+
 	my $tb = Text::Table->new(
 		{ title => "Model", align => 'left' },
 		{ title => "Rank", align => 'point', align_title => 'center'  },
@@ -785,13 +846,13 @@ sub list_models {
         my $uses = $mstats->{total_uses} // 0;
         my $locs = $mstats->{locations} // [];
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
-        
+
         # Build location display: SSD (bright cyan) first, then HDD (yellow)
         my @loc_display;
         push @loc_display, "${bcya}SSD${rst}" if grep { $_ eq 'ssd' } @$locs;
         push @loc_display, "${yel}HDD${rst}" if grep { $_ eq 'hdd' } @$locs;
         my $loc_str = @loc_display ? join(' ', @loc_display) : '?';
-        
+
         # printf "%s%-40s$rst  rank:%6s  uses:%3d  loc:%s%-3s$rst  last:%s\n",
         #     $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
         $tb->add("$cya$model$rst", $rank, $uses, $loc_str, $last);
