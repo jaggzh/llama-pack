@@ -1,5 +1,7 @@
 #!/usr/bin/perl
 BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
+# system('env | grep -E "(CUDA|LLAMA|LD_|PATH)" > /tmp/script_env.txt');
+# exit;
 use v5.36;
 use JSON::XS;
 use File::Find;
@@ -21,6 +23,7 @@ my $def_port = 8080;
 my $def_host = '127.0.0.1';
 my $config_dir = $ENV{HOME} . "/.config/$progname";
 my $config_file = "$config_dir/config.json";
+my $editor = $ENV{EDITOR} // 'vim';
 
 # bansi color exports
 our ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra);
@@ -33,6 +36,13 @@ init_colors();
 our $verbose = $ENV{LLAMA_SERVE_VERBOSE} // 0;
 our $stats_dirty = 0;
 our $current_runtime_start;
+
+use v5.36; # nice
+sub se; sub sel; sub pe; sub pel; # Keep for use w/o ()
+sub pe { print STDERR @_; }
+sub pel { my $l=shift; print STDERR @_ if $verbose >= $l; }
+sub se { say STDERR @_; }
+sub sel { my $l=shift; say STDERR @_ if $verbose >= $l; }
 
 END {
     write_stats() if $stats_dirty;
@@ -47,11 +57,13 @@ $SIG{INT} = $SIG{TERM} = sub {
 main();
 
 sub main {
-    my $config = load_config();
-
     # Parse our args vs llama-server args
     my ($opts, $llama_args) = parse_args();
 
+    # Handle commands that don't need config loaded
+    if ($opts->{edit_config}) { edit_config(); exit }
+
+    my $config = load_config();
     # Apply config defaults if not specified on command line
     $opts->{port} //= $config->{default_port} // $def_port;
     $opts->{host} //= $config->{default_host} // $def_host;
@@ -64,6 +76,11 @@ sub main {
     push @$llama_args, '--host', $opts->{host} unless $has_host;
 
     # Handle commands that don't need model loading
+    if ($opts->{edit_config}) {
+    	edit_config();
+        exit 0;
+    }
+
     if ($opts->{list}) {
         list_models($config);
         exit 0;
@@ -204,22 +221,20 @@ sub usage {
 		  -p, --port N         Server port (default: $def_port)
 		  --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
 		  --store, --keep      Save model-specific args for future runs
-
 		MANAGING MODELS:
 		  -l, --list           List all models with stats and rankings
 		  -u, --update         Scan directories and update model index
 		  --status, --stat     Show currently running servers
 		  --st
-
+		  --ec --ce --edit-config  Edit, like: $editor config_file
+		                       (Uses env var \$EDITOR)
 		KILLING SERVERS:
 		  -k, --kill           Kill server on specified port (use with -p/--port)
 		  --killall, --kall    Kill ALL $progname managed servers
-
 		SIMULATION:
 		  --simulate NAME      Run named simulation preset from config
 		  --simulate PATTERN   Run custom simulation pattern (contains = or ;)
 		  --sim-ssd-free SIZE  Override SSD free space (e.g. 50g, 100m, 1.5g)
-
 		OTHER:
 		  -v, --verbose        Increase verbosity (use multiple times: -v -v)
 		  -h, --help           This help
@@ -298,6 +313,8 @@ sub parse_args {
             $opts{port} = $port;
         } elsif ($arg eq '--store' || $arg eq '--keep') {
             $opts{store} = 1;
+        } elsif ($arg eq '--ce' || $arg eq '--ec' || $arg eq '--edit-config') {
+            $opts{edit_config} = 1;
         } elsif ($arg eq '-v' || $arg eq '--verbose') {
             $verbose++;
         } else {
@@ -345,7 +362,6 @@ sub load_config {
             '-ngl', '80',
             '-c', '15000',
             '--jinja',
-            '--reranking',
         ],
         simulations => {
             simple => {
@@ -403,7 +419,6 @@ sub load_config {
 		    "-ngl", "80",
 		    "-c", "15000",
 		    "--jinja",
-		    "--reranking"
 		  ],
 
 		  // Simulation presets (see --help for pattern format)
@@ -658,7 +673,7 @@ sub start_server {
     my $binary = $config->{server_binary};
     my @cmd = ($binary, '-m', $model_info->{path}, @$llama_args);
 
-    say "${gre}Starting: " . join(' ', @cmd) . $rst if $verbose;
+    se "${gre}Starting: $rst" . join(' ', @cmd);
 
     # Write PID file BEFORE forking so we have the file reference
     my $pid_file = get_pid_file($config, $opts->{port});
@@ -885,6 +900,10 @@ sub update_current_runtime {
     # Runtime is now logged in start_server() when server exits
     # This stub remains for signal handlers
     $stats_dirty = 1;
+}
+
+sub edit_config {
+	system($editor, $config_file);
 }
 
 sub list_models {
