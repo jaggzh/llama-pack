@@ -2,6 +2,8 @@
 
 Smart SSD caching for llama.cpp models. Automatically copies frequently-used models from slow HDD to fast SSD.
 
+Designed so we can support other servers if someone wants to add them.
+
 ## Quick Start
 ```bash
 # Alias for convenience
@@ -10,6 +12,8 @@ alias llp=llama-pack
 # First run creates default config
 llp --update
 # Edit ~/.config/llama-pack/config.json - set your ssd_path, hdd_path, and server_binary
+# ...or...
+lpp --ec  # Will pop up editor on config with $EDITOR // vim
 
 # Scan your model directories
 llp --update
