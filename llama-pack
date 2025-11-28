@@ -968,6 +968,12 @@ sub edit_config {
 sub list_models {
     my $config = shift;
     
+    # Get terminal width
+    my $term_width = eval { 
+        require Term::Size;
+        (Term::Size::chars())[0] // $ENV{COLUMNS} // 79;
+    } || $ENV{COLUMNS} || 79;
+    
     # Use global $stats if loaded, otherwise load it
     my $stats_to_use = $stats // load_stats($config);
 
@@ -985,93 +991,186 @@ sub list_models {
     } keys %$stats_to_use;
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
-
-	my $tb = Text::Table->new(
-		{ title => "Model", align => 'left' },
-		{ title => "Rank", align => 'point', align_title => 'center'  },
-		{ title => "Uses", align => 'right', align_title => 'right' },
-		\"  ",
-		{ title => "Loc", align => 'left' },
-		{ title => "Last", align => 'left' },
-	);
-	
-	my @ssd_only_models;
-	
+    
+    # Determine if we need to wrap based on longest model name + stats width
+    my $longest_model = 0;
+    for my $model (@models) {
+        my $len = length($model);
+        $longest_model = $len if $len > $longest_model;
+    }
+    
+    # Stats columns: Rank(6) + SSD(5) + HDD(5) + Last(12) + Uses(6) + Mtime(12) + spacing = ~55
+    my $stats_width = 55;
+    my $need_wrap = ($longest_model + $stats_width) > $term_width;
+    my $wrapped_indent = ' ';
+    
+    my $tb;
+    if ($need_wrap) {
+        # Wrapped mode - no "Model" header, just indented stats columns
+        $tb = Text::Table->new(
+            $wrapped_indent,
+            { title => "Rank", align => 'point', align_title => 'center'  },
+            \"  ",
+            { title => "SSD", align => 'left' },
+            \"  ",
+            { title => "HDD", align => 'left' },
+            \"  ",
+            { title => "Last", align => 'left' },
+            \"  ",
+            { title => "Uses", align => 'right', align_title => 'right' },
+            \"  ",
+            { title => "Mtime", align => 'left' },
+        );
+    } else {
+        # Normal table with Model column
+        $tb = Text::Table->new(
+            { title => "Model", align => 'left' },
+            \"  ",
+            { title => "Rank", align => 'point', align_title => 'center'  },
+            \"  ",
+            { title => "ssd", align => 'left' },
+            \"  ",
+            { title => "hdd", align => 'left' },
+            \"  ",
+            { title => "Last", align => 'left' },
+            \"  ",
+            { title => "Uses", align => 'right', align_title => 'right' },
+            \"  ",
+            { title => "Mtime", align => 'left' },
+        );
+    }
+    
+    my @ssd_only_models;
+    
     for my $model (@models) {
         my $mstats = $stats_to_use->{$model};
         my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
         my $uses = $mstats->{total_uses} // 0;
-        my $locs = $mstats->{locations} // [];
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
-
-        # Get actual stored path and check both possible locations
-        my $stored_path = $mstats->{path};
-        my $ssd_base = $config->{ssd_path};
-        my $hdd_base = $config->{hdd_path};
         
-        # Determine where the stored path actually is
-        my $on_ssd = 0;
-        my $on_hdd = 0;
-        
-        if ($stored_path && $stored_path =~ /^\Q$ssd_base\E/) {
-            $on_ssd = -f $stored_path;
-            # Check if also on HDD
-            my $hdd_path = $stored_path;
-            $hdd_path =~ s/^\Q$ssd_base\E/$hdd_base/;
-            $on_hdd = -f $hdd_path;
-        } elsif ($stored_path && $stored_path =~ /^\Q$hdd_base\E/) {
-            $on_hdd = -f $stored_path;
-            # Check if also on SSD
-            my $ssd_path = $stored_path;
-            $ssd_path =~ s/^\Q$hdd_base\E/$ssd_base/;
-            $on_ssd = -f $ssd_path;
-        } else {
-            # Path doesn't match either base, just check if file exists
-            $on_hdd = $stored_path && -f $stored_path;
+        # Format mtime
+        my $mtime_str = 'unknown';
+        if ($mstats->{mtime}) {
+            my $mtime_obj = gmtime($mstats->{mtime});
+            $mtime_str = $mtime_obj->strftime('%Y-%m-%d');
         }
+
+        # Get locations from stats - trust what scan_models found
+        my $locs = $mstats->{locations} // [];
+        my $on_ssd = grep { $_ eq 'ssd' } @$locs;
+        my $on_hdd = grep { $_ eq 'hdd' } @$locs;
+        
+        # Check if file still exists (for stats-only detection)
+        my $stored_path = $mstats->{path};
+        my $exists_on_disk = $stored_path && -f $stored_path;
         
         # Track SSD-only models (dangerous state)
-        if ($on_ssd && !$on_hdd) {
+        if ($on_ssd && !$on_hdd && $exists_on_disk) {
             push @ssd_only_models, $stored_path;
         }
         
         # Check if it should be cached
         my $should_cache = should_cache_to_ssd($mstats);
 
-        # Build location display
-        my @loc_display;
+        # Build separate SSD and HDD display strings
+        my $ssd_str = '';
+        my $hdd_str = '';
         
-        # SSD status
-        if ($on_ssd && $should_cache) {
-            # On SSD and belongs there (high usage)
-            push @loc_display, "${bcya}SSD${rst}";
-        } elsif ($on_ssd && !$should_cache) {
-            # On SSD but doesn't belong (low usage, might expire)
-            push @loc_display, "${bcya}ssd${rst}";
-        } elsif (!$on_ssd && $should_cache) {
-            # Should be on SSD but isn't
-            push @loc_display, "${yel}{SSD}${rst}";
+        if (!$exists_on_disk) {
+            # Model deleted from disk but stats remain
+            $ssd_str = "${rst}${bro}st${rst}";
+            $hdd_str = "${rst}${bro}st${rst}";
+        } else {
+            # SSD status
+            if ($on_ssd && $should_cache) {
+                $ssd_str = "${bcya}SSD${rst}";
+            } elsif ($on_ssd && !$should_cache) {
+                $ssd_str = "${bcya}ssd${rst}";
+            } elsif (!$on_ssd && $should_cache) {
+                $ssd_str = "${yel}{SSD}${rst}";
+            }
+            
+            # HDD status
+            if ($on_hdd) {
+                $hdd_str = "${yel}HDD${rst}";
+            }
+            
+            # Special case: only on SSD (dangerous)
+            if ($on_ssd && !$on_hdd) {
+                $hdd_str = "${red}***${rst}";
+            }
         }
-        
-        # HDD status
-        if ($on_hdd && $on_ssd) {
-            # On HDD as backup (lowercase)
-            push @loc_display, "${gra}hdd${rst}";
-        } elsif ($on_hdd && !$on_ssd) {
-            # On HDD as primary/only storage (uppercase)
-            push @loc_display, "${yel}HDD${rst}";
-        }
-        
-        # Special case: only on SSD (dangerous)
-        if ($on_ssd && !$on_hdd) {
-            push @loc_display, "${red}***${rst}";
-        }
-        
-        my $loc_str = @loc_display ? join(' ', @loc_display) : "${red}???${rst}";
 
-        $tb->add("$cya$model$rst", $rank, $uses, $loc_str, $last);
+        if ($need_wrap) {
+            # Model name on its own line, then stats on next line with indent
+            say "$cya$model$rst";
+            $tb->add('', $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+        } else {
+            # Normal single-line display
+            $tb->add("$cya$model$rst", $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+        }
     }
-    print $tb;
+
+    # Output the table
+    if ($need_wrap) {
+        # Print title first
+        print $tb->title;
+        
+        # Get table body rows
+        my @tb_rows = split /\n/, $tb->body;
+        
+        # Print each model name followed by its stats row
+        for my $i (0 .. $#models) {
+            say "$cya$models[$i]$rst";
+            say $tb_rows[$i] if $i < @tb_rows;
+        }
+        
+        # Print title at bottom
+        print $tb->title;
+    } else {
+        # Normal mode - just print table
+        print $tb;
+        print $tb->title;
+    }
+    
+    # Build and wrap key intelligently
+    my @key_items = (
+        "Key:",
+        "SSD=cached+hot",
+        "ssd=cached+cold",
+        "{SSD}=should cache",
+        "HDD=permanent",
+        "${rst}${bro}st${rst}${gra}=stats only",
+        "${red}***${rst}${gra}=SSD only!",
+    );
+    
+    # Build key with intelligent wrapping
+    my $key_line = "${gra}";
+    my $current_len = 0;
+    my $first_item = 1;
+    
+    for my $item (@key_items) {
+        # Strip color codes to measure actual length
+        my $item_plain = $item;
+        $item_plain =~ s/\e\[[0-9;]+m//g;
+        my $item_len = length($item_plain);
+        
+        my $separator = $first_item ? "" : ", ";
+        my $sep_len = length($separator);
+        
+        if ($current_len > 0 && ($current_len + $sep_len + $item_len) > $term_width) {
+            # Wrap to next line
+            $key_line .= "\n${gra}     ";  # 5-space indent
+            $current_len = 5;
+            $separator = "";
+        }
+        
+        $key_line .= $separator . $item;
+        $current_len += $sep_len + $item_len;
+        $first_item = 0;
+    }
+    
+    say $key_line . $rst;
     
     # Warn about SSD-only models
     if (@ssd_only_models) {
