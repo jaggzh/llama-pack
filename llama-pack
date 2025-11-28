@@ -555,9 +555,26 @@ sub find_model {
     # Try exact match first
     if ($stats->{$model_name}) {
         my $locs = $stats->{$model_name}{locations} // [];
-        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
+        
+        # Check actual filesystem for SSD presence (stats might be stale)
+        my $ssd_path = $config->{ssd_path} . '/' . $model_name;
+        my $has_ssd_file = -f $ssd_path;
+        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
+        
+        # Update stats if we found SSD file that's not in stats
+        if ($has_ssd_file && !$has_ssd_stat) {
+            push @$locs, 'ssd';
+            $stats->{$model_name}{locations} = $locs;
+            $stats->{$model_name}{path} = $ssd_path;
+            $stats_dirty = 1;
+        }
+        
+        # Prefer SSD if available
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+        my $path = $has_ssd_file ? $ssd_path : $stats->{$model_name}{path};
+        
         return {
-            path => $stats->{$model_name}{path},
+            path => $path,
             location => $preferred,
             locations => $locs,
         };
@@ -574,9 +591,25 @@ sub find_model {
     } elsif (@matches == 1) {
         my $key = $matches[0];
         my $locs = $stats->{$key}{locations} // [];
-        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
+        
+        # Check actual filesystem for SSD presence
+        my $ssd_path = $config->{ssd_path} . '/' . $key;
+        my $has_ssd_file = -f $ssd_path;
+        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
+        
+        # Update stats if we found SSD file that's not in stats
+        if ($has_ssd_file && !$has_ssd_stat) {
+            push @$locs, 'ssd';
+            $stats->{$key}{locations} = $locs;
+            $stats->{$key}{path} = $ssd_path;
+            $stats_dirty = 1;
+        }
+        
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+        my $path = $has_ssd_file ? $ssd_path : $stats->{$key}{path};
+        
         return {
-            path => $stats->{$key}{path},
+            path => $path,
             location => $preferred,
             locations => $locs,
         };
@@ -597,9 +630,25 @@ sub find_model {
         say "${gre}Using highest-ranked: $chosen$rst";
 
         my $locs = $stats->{$chosen}{locations} // [];
-        my $preferred = (grep { $_ eq 'ssd' } @$locs) ? 'ssd' : $locs->[0] // 'unknown';
+        
+        # Check actual filesystem for SSD presence
+        my $ssd_path = $config->{ssd_path} . '/' . $chosen;
+        my $has_ssd_file = -f $ssd_path;
+        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
+        
+        # Update stats if we found SSD file that's not in stats
+        if ($has_ssd_file && !$has_ssd_stat) {
+            push @$locs, 'ssd';
+            $stats->{$chosen}{locations} = $locs;
+            $stats->{$chosen}{path} = $ssd_path;
+            $stats_dirty = 1;
+        }
+        
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+        my $path = $has_ssd_file ? $ssd_path : $stats->{$chosen}{path};
+        
         return {
-            path => $stats->{$chosen}{path},
+            path => $path,
             location => $preferred,
             locations => $locs,
         };
@@ -650,13 +699,19 @@ sub should_cache_to_ssd {
 
 sub fork_ssd_copy {
     my ($config, $model_info, $stats) = @_;
+    
+    my $src = $model_info->{path};
+    my $dst = $config->{ssd_path} . '/' . basename($src);
+    
+    # Check if already exists on SSD
+    if (-f $dst) {
+        say "${gre}Model already cached on SSD: $dst$rst" if $verbose;
+        return;
+    }
 
     my $pid = fork();
     if ($pid == 0) {
         # Child process
-        my $src = $model_info->{path};
-        my $dst = $config->{ssd_path} . '/' . basename($src);
-
         say "${blu}[Background] Copying to SSD: $src -> $dst$rst" if $verbose;
 
         copy($src, $dst) or do {
@@ -667,7 +722,16 @@ sub fork_ssd_copy {
         say "${gre}[Background] Copy complete.$rst" if $verbose;
         exit 0;
     }
-    # Parent continues
+    # Parent: optimistically update stats to reflect future SSD presence
+    my $model_key = basename($src);
+    if ($stats->{$model_key}) {
+        my $locs = $stats->{$model_key}{locations} // [];
+        if (!grep { $_ eq 'ssd' } @$locs) {
+            push @$locs, 'ssd';
+            $stats->{$model_key}{locations} = $locs;
+            $stats_dirty = 1;
+        }
+    }
 }
 
 sub start_server {
@@ -930,6 +994,9 @@ sub list_models {
 		{ title => "Loc", align => 'left' },
 		{ title => "Last", align => 'left' },
 	);
+	
+	my @ssd_only_models;
+	
     for my $model (@models) {
         my $mstats = $stats_to_use->{$model};
         my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
@@ -937,17 +1004,85 @@ sub list_models {
         my $locs = $mstats->{locations} // [];
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
 
-        # Build location display: SSD (bright cyan) first, then HDD (yellow)
-        my @loc_display;
-        push @loc_display, "${bcya}SSD${rst}" if grep { $_ eq 'ssd' } @$locs;
-        push @loc_display, "${yel}HDD${rst}" if grep { $_ eq 'hdd' } @$locs;
-        my $loc_str = @loc_display ? join(' ', @loc_display) : '?';
+        # Get actual stored path and check both possible locations
+        my $stored_path = $mstats->{path};
+        my $ssd_base = $config->{ssd_path};
+        my $hdd_base = $config->{hdd_path};
+        
+        # Determine where the stored path actually is
+        my $on_ssd = 0;
+        my $on_hdd = 0;
+        
+        if ($stored_path && $stored_path =~ /^\Q$ssd_base\E/) {
+            $on_ssd = -f $stored_path;
+            # Check if also on HDD
+            my $hdd_path = $stored_path;
+            $hdd_path =~ s/^\Q$ssd_base\E/$hdd_base/;
+            $on_hdd = -f $hdd_path;
+        } elsif ($stored_path && $stored_path =~ /^\Q$hdd_base\E/) {
+            $on_hdd = -f $stored_path;
+            # Check if also on SSD
+            my $ssd_path = $stored_path;
+            $ssd_path =~ s/^\Q$hdd_base\E/$ssd_base/;
+            $on_ssd = -f $ssd_path;
+        } else {
+            # Path doesn't match either base, just check if file exists
+            $on_hdd = $stored_path && -f $stored_path;
+        }
+        
+        # Track SSD-only models (dangerous state)
+        if ($on_ssd && !$on_hdd) {
+            push @ssd_only_models, $stored_path;
+        }
+        
+        # Check if it should be cached
+        my $should_cache = should_cache_to_ssd($mstats);
 
-        # printf "%s%-40s$rst  rank:%6s  uses:%3d  loc:%s%-3s$rst  last:%s\n",
-        #     $whi, $model, $rank, $uses, $loc_color, uc($loc), $last;
+        # Build location display
+        my @loc_display;
+        
+        # SSD status
+        if ($on_ssd && $should_cache) {
+            # On SSD and belongs there (high usage)
+            push @loc_display, "${bcya}SSD${rst}";
+        } elsif ($on_ssd && !$should_cache) {
+            # On SSD but doesn't belong (low usage, might expire)
+            push @loc_display, "${bcya}ssd${rst}";
+        } elsif (!$on_ssd && $should_cache) {
+            # Should be on SSD but isn't
+            push @loc_display, "${yel}{SSD}${rst}";
+        }
+        
+        # HDD status
+        if ($on_hdd && $on_ssd) {
+            # On HDD as backup (lowercase)
+            push @loc_display, "${gra}hdd${rst}";
+        } elsif ($on_hdd && !$on_ssd) {
+            # On HDD as primary/only storage (uppercase)
+            push @loc_display, "${yel}HDD${rst}";
+        }
+        
+        # Special case: only on SSD (dangerous)
+        if ($on_ssd && !$on_hdd) {
+            push @loc_display, "${red}***${rst}";
+        }
+        
+        my $loc_str = @loc_display ? join(' ', @loc_display) : "${red}???${rst}";
+
         $tb->add("$cya$model$rst", $rank, $uses, $loc_str, $last);
     }
     print $tb;
+    
+    # Warn about SSD-only models
+    if (@ssd_only_models) {
+        say "\n${red}${inv} WARNING $rst ${yel}@{[scalar @ssd_only_models]} model(s) only on SSD (not on HDD)$rst";
+        say "${gra}These models won't be expired from SSD even if space is low.${rst}";
+        say "${gra}Models on SSD missing from HDD:${rst}";
+        for my $path (@ssd_only_models) {
+            say "  ${red}$path${rst}";
+        }
+        say "";
+    }
 }
 
 # ============================================================================
