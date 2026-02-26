@@ -664,7 +664,7 @@ sub load_config {
 		    "--flash-attn",
 		    "-ngl", "80",
 		    "-c", "15000",
-		    "--jinja",
+		    "--jinja"
 		  ],
 
 		  // Simulation presets (see --help for pattern format)
