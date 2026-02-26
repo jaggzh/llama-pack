@@ -4,7 +4,12 @@ Smart SSD caching for llama.cpp models. Automatically copies frequently-used mod
 
 Designed so we can support other servers if someone wants to add them.
 
-# DIY Captions:
+1.  [Quick Start](#quick-start)
+2.  [How It Works](#how-it-works)
+3.  [Config](#config)
+4.  [Full --help](#full--help)
+5.  [Tips](#tips)
+
 <div align="center">
   <em>Overview of <b>llama-pack -l</b></em><br>
   <img src="i/ss-list.png" alt="Overview of llama-pack -l"><br>
