@@ -72,17 +72,58 @@ Edit `~/.config/llama-pack/config.json`:
 - `global_llama_args`: Args passed to ALL models
 - `server_binary`: Path to llama-server binary
 
+## Full --help
+
+```
+llama-pack: Manage and load LLM models with smart SSD caching.
+
+RUNNING MODELS:
+  -m, --model NAME     Load model by name/pattern
+  -p, --port N         Server port (default: 8080)
+  --host ADDR          Server host (default: 127.0.0.1, use 0.0.0.0 for all interfaces)
+  --store, --keep      Save model-specific args for future runs
+MANAGING MODELS:
+  -l, --list           List all models with stats and rankings
+  -u, --update         Scan directories and update model index
+  --status, --stat     Show currently running servers
+  --st
+  --ec --ce --edit-config  Edit, like: vim config_file
+                       (Uses env var $EDITOR)
+KILLING SERVERS:
+  -k, --kill           Kill server on specified port (use with -p/--port)
+  --killall, --kall    Kill ALL llama-pack managed servers
+SIMULATION:
+  --simulate NAME      Run named simulation preset from config
+  --simulate PATTERN   Run custom simulation pattern (contains = or ;)
+  --sim-ssd-free SIZE  Override SSD free space (e.g. 50g, 100m, 1.5g)
+OTHER:
+  -v, --verbose        Increase verbosity (use multiple times: -v -v)
+  -h, --help           This help
+  --                   Everything after this goes to llama-server
+
+EXAMPLES:
+  llama-pack -m mymodel                    # Load model with saved args
+  llama-pack -m mymodel -- -c 8192         # Override context size once
+  llama-pack -m mymodel --store -- -c 8192 # Save new context size
+  llama-pack -k -p 8080                    # Kill server on port 8080
+  llama-pack --killall                     # Kill all running servers
+  llama-pack --status                      # Show what's running
+  llama-pack --simulate daily_work         # Run simulation preset
+  llama-pack --simulate "test:10g=0s/1h,1d/2h" --sim-ssd-free 50g
+
+*Note: Simulation preset names may not contain = or ;
+
+CONFIG: /home/user/.config/llama-pack/config.json
+```
+
 ## Tips
 
 Run with `-v` for verbose output showing paths and decisions.
 Run with `-v -v` for even more detail.
-```
 
----
-
-Now, want me to implement the `-v` path display feature for `-l`? It would show indented paths under each model like:
 ```
 Gemma2-9B-Q5_K.gguf
    6.5  SSD  hdd  2025-11-28    6  2025-11-20
    ssd: /home/user/.../models/ssd/Gemma2-9B-Q5_K.gguf
    hdd: /home/user/.../models/hdd/llm/Gemma2-9B-Q5_K.gguf
+```
