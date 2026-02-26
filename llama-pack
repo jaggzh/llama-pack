@@ -8,6 +8,7 @@ use File::Find;
 use File::Path qw(make_path);
 use File::Copy;
 use File::Basename;
+use File::Slurper qw(read_text write_text);
 use Digest::MD5 qw(md5_hex);
 use Time::Piece;
 use Fcntl qw(:flock);
@@ -26,11 +27,12 @@ my $config_dir = $ENV{HOME} . "/.config/$progname";
 my $config_file = "$config_dir/config.json";
 my $editor = $ENV{EDITOR} // 'vim';
 
-# bansi color exports
+# ANSI color exports
 our ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra);
 our ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra);
 our ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi);
 our ($rst, $inv, $cll, $cllr, $cls, $clsb, $ahome);
+our ($c_warn, $c_err, $c_attn, $c_attn_ctx, $c_sel, $c_tag);
 
 init_colors();
 
@@ -40,7 +42,7 @@ our $current_runtime_start;
 our $stats;  # Global stats hash - loaded once, modified in memory, written on exit
 
 use v5.36; # nice
-sub se; sub sel; sub pe; sub pel; # Keep for use w/o ()
+sub se; sub sel; sub pe; sub pel; sub serr; sub swarn; # Keep for use w/o ()
 sub pe { print STDERR @_; }
 sub pel { my $l=shift; print STDERR @_ if $verbose >= $l; }
 sub se { say STDERR @_; }
@@ -78,11 +80,6 @@ sub main {
     push @$llama_args, '--host', $opts->{host} unless $has_host;
 
     # Handle commands that don't need model loading
-    if ($opts->{edit_config}) {
-    	edit_config();
-        exit 0;
-    }
-
     if ($opts->{list}) {
         list_models($config);
         exit 0;
@@ -90,6 +87,16 @@ sub main {
 
     if ($opts->{status}) {
         show_status($config);
+        exit 0;
+    }
+
+    if ($opts->{taglist}) {
+        list_known_tags($config);
+        exit 0;
+    }
+
+    if ($opts->{list_mmproj}) {
+        list_mmproj($config);
         exit 0;
     }
 
@@ -105,18 +112,135 @@ sub main {
     }
 
     # If -k without model, just kill
-    if ($opts->{kill} && !$opts->{model}) {
+    if ($opts->{kill} && !$opts->{model} && !$opts->{manage_model}) {
         kill_instances($config, $opts);
         exit 0;
     }
 
     # If -k WITH model, kill first then continue to load model
-    if ($opts->{kill} && $opts->{model}) {
-        say "${yel}Killing existing server(s) before loading model...$rst" if $verbose;
+    if ($opts->{kill} && ($opts->{model} || $opts->{manage_model})) {
+        say "${c_warn}Killing existing server(s) before loading model...$rst" if $verbose;
         kill_instances($config, $opts);
     }
 
-    # Need a model to proceed
+    # Load stats ONCE into global
+    $stats = load_stats($config);
+
+    # Handle global tag operations (must happen before model tag operations)
+    if ($opts->{gtag_ops} && @{$opts->{gtag_ops}}) {
+        for my $op (@{$opts->{gtag_ops}}) {
+            manage_global_tag($config, $op);
+        }
+    }
+
+    if ($opts->{tag_rename}) {
+        rename_global_tag($config, $stats, $opts->{tag_rename});
+    }
+
+    if ($opts->{tag_desc}) {
+        update_tag_description($config, $opts->{tag_desc});
+    }
+
+    # Determine which model to work with
+    my $target_model = $opts->{manage_model} || $opts->{model};
+
+    if ($verbose >= 2) {
+        say "${gre}DEBUG: target_model=$target_model$rst" if $target_model;
+        say "${gre}DEBUG: mmproj=$$opts{mmproj}$rst" if $opts->{mmproj};
+        say "${gre}DEBUG: rm_mmproj=$$opts{rm_mmproj}$rst" if $opts->{rm_mmproj};
+        say "${gre}DEBUG: manage_model=$$opts{manage_model}$rst" if $opts->{manage_model};
+    }
+
+    # If -M without other operations, show model details
+    if ($opts->{manage_model} && !$opts->{model} &&
+        !$opts->{tags} && !$opts->{note_edit} && !$opts->{note_str} && !$opts->{note_del} &&
+        !$opts->{mmproj} && !$opts->{rm_mmproj}) {
+        show_model_details($config, $stats, $opts->{manage_model});
+        exit 0;
+    }
+
+    # Handle tag operations on specific model
+    if ($target_model && $opts->{tags}) {
+        my $model_info = find_model($config, $stats, $target_model);
+        if (!$model_info) {
+            serr(0, "Model '$target_model' not found.");
+            exit 1;
+        }
+        my $model_key = basename($model_info->{path});
+
+        my $known_tags = get_known_tags($config);
+        for my $tag_op (@{$opts->{tags}}) {
+            if ($tag_op =~ /^-(.+)$/) {
+                # Remove tag
+                remove_model_tag($stats, $model_key, $1);
+            } else {
+                # Add tag
+                add_model_tag($stats, $model_key, $tag_op, $known_tags);
+            }
+        }
+
+        # If only managing (not loading), exit now
+        if ($opts->{manage_model} && !$opts->{model}) {
+            exit 0;
+        }
+    }
+
+    # Handle note operations on specific model
+    if ($target_model && ($opts->{note_edit} || $opts->{note_str} || $opts->{note_del})) {
+        my $model_info = find_model($config, $stats, $target_model);
+        if (!$model_info) {
+            serr(0, "Model '$target_model' not found.");
+            exit 1;
+        }
+        my $model_key = basename($model_info->{path});
+
+        if ($opts->{note_del}) {
+            delete_model_note($stats, $model_key);
+        } elsif ($opts->{note_str}) {
+            set_model_note($stats, $model_key, $opts->{note_str});
+        } elsif ($opts->{note_edit}) {
+            edit_model_note($stats, $model_key, $editor);
+        }
+
+        # If only managing (not loading), exit now
+        if ($opts->{manage_model} && !$opts->{model}) {
+            exit 0;
+        }
+    }
+
+    # Handle mmproj operations on specific model
+    if ($target_model && ($opts->{mmproj} || $opts->{rm_mmproj})) {
+        say "${gre}DEBUG: Handling mmproj for $target_model$rst" if $verbose >= 2;
+        my $model_info = find_model($config, $stats, $target_model);
+        if (!$model_info) {
+            say STDERR "Error: Model '$target_model' not found.";
+            exit 1;
+        }
+        my $model_key = basename($model_info->{path});
+        say "${gre}DEBUG: Found model_key: $model_key$rst" if $verbose >= 2;
+
+        if ($opts->{rm_mmproj}) {
+            if (exists $stats->{$model_key}{mmproj}) {
+                delete $stats->{$model_key}{mmproj};
+                $stats_dirty = 1;
+                say "Removed mmproj association from $model_key";
+            } else {
+                say "No mmproj associated with $model_key";
+            }
+        } elsif ($opts->{mmproj}) {
+            # Just store the name, we'll find the path at load time
+            $stats->{$model_key}{mmproj} = $opts->{mmproj};
+            $stats_dirty = 1;
+            say "Associated mmproj '$$opts{mmproj}' with $model_key";
+        }
+
+        # If only managing (not loading), exit now
+        if ($opts->{manage_model} && !$opts->{model}) {
+            exit 0;
+        }
+    }
+
+    # Need a model to proceed with loading
     unless ($opts->{model}) {
         serr(0, "No model specified. Use -m or --model");
         exit 1;
@@ -126,10 +250,14 @@ sub main {
     if (!-f $config->{stats_file}) {
         say "${yel}First run detected. Scanning for models...$rst";
         scan_models($config);
+        $stats = load_stats($config);
     }
 
     # Load stats ONCE into global
-    $stats = load_stats($config);
+    swarn 0, "Removed load_stats() from the every-run approach. Need to make sure that was okay.";
+	# We might need to uncomment this, but it's likely claude made this properly only load
+	# stats in paths that need it.
+    # $stats = load_stats($config);
 
     # Find the model (future: check nicknames first)
     my $model_info = find_model($config, $stats, $opts->{model});
@@ -168,6 +296,17 @@ sub main {
     # Prepend global args from config
     my @global_args = @{$config->{global_llama_args} // []};
     unshift @final_llama_args, @global_args;
+
+    # Handle mmproj if associated with model and not disabled
+    if (!$opts->{no_mmproj} && $mstats->{mmproj}) {
+        my $mmproj_path = find_mmproj($config, $mstats->{mmproj});
+        if ($mmproj_path) {
+            say "${gre}Found mmproj: $mmproj_path$rst" if $verbose;
+            unshift @final_llama_args, '--mmproj', $mmproj_path;
+        } else {
+            say "${c_warn}mmproj '$$mstats{mmproj}' not found, skipping$rst";
+        }
+    }
 
     # Check if already running with same args
     my $pid_file = get_pid_file($config, $opts->{port});
@@ -220,23 +359,59 @@ sub usage {
 
 		RUNNING MODELS:
 		  -m, --model NAME     Load model by name/pattern
+		  -M, --manage NAME    Manage model metadata without loading
+		                       (shows details if no other options)
 		  -p, --port N         Server port (default: $def_port)
 		  --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
 		  --store, --keep      Save model-specific args for future runs
+
 		MANAGING MODELS:
 		  -l, --list           List all models with stats and rankings
 		  -u, --update         Scan directories and update model index
 		  --status, --stat     Show currently running servers
 		  --st
-		  --ec --ce --edit-config  Edit, like: $editor config_file
+
+		TAGS (model-specific):
+		  -t, --tag TAGS       Add/remove tags (e.g., -t au,img or -t au,-abl)
+		                       Space or comma-separated, prefix with - to remove
+
+		GLOBAL TAG REGISTRY:
+		  --gtag TAG:DESC      Add tag to global registry
+		  --gtag -TAG          Remove tag from global registry
+		  --tag-list, --taglist, --tlist, --tl
+		                       List all known tags
+		  --tag-rename, --tagrename, --tren, --tr OLD:NEW
+		                       Rename tag everywhere
+		  --tag-desc, --tagdesc, --tdesc, --td TAG:DESC
+		                       Update tag description
+
+		NOTES (model-specific):
+		  --note-edit, --noteedit, --note, --ne
+		                       Edit note in \$EDITOR
+		  --note-str, --notestr, --nstr, --ns "TEXT"
+		                       Set note from command line
+		  --note-del, --notedel, --ndel, --nd
+		                       Delete note
+
+		MMPROJ (multimodal projection files):
+		  --mmproj FILE        Associate mmproj file with model
+		  --no-mmproj          Don't load mmproj for this run
+		  --rm-mmproj          Remove mmproj association from model
+		  --list-mmproj, --lmm List all mmproj files
+
+		CONFIG:
+		  --ec --ce --edit-config  Edit config: $editor config_file
 		                       (Uses env var \$EDITOR)
+
 		KILLING SERVERS:
 		  -k, --kill           Kill server on specified port (use with -p/--port)
 		  --killall, --kall    Kill ALL $progname managed servers
+
 		SIMULATION:
 		  --simulate NAME      Run named simulation preset from config
 		  --simulate PATTERN   Run custom simulation pattern (contains = or ;)
 		  --sim-ssd-free SIZE  Override SSD free space (e.g. 50g, 100m, 1.5g)
+
 		OTHER:
 		  -v, --verbose        Increase verbosity (use multiple times: -v -v)
 		  -h, --help           This help
@@ -246,6 +421,15 @@ sub usage {
 		  $progname -m mymodel                    # Load model with saved args
 		  $progname -m mymodel -- -c 8192         # Override context size once
 		  $progname -m mymodel --store -- -c 8192 # Save new context size
+		  $progname -M mymodel                    # Show model details
+		  $progname -M mymodel -t au,img          # Add tags without loading
+		  $progname -m mymodel -t au -- -c 8192   # Tag and load
+		  $progname --gtag au:"Audio capable"     # Add tag to registry
+		  $progname --tl                          # List known tags
+		  $progname -M mymodel --note             # Edit note in vim
+		  $progname -m gemma3 --mmproj mmproj-gemma3.gguf  # Associate mmproj
+		  $progname -m gemma3 --no-mmproj         # Load without mmproj
+		  $progname --lmm                         # List all mmproj files
 		  $progname -k -p 8080                    # Kill server on port 8080
 		  $progname --killall                     # Kill all running servers
 		  $progname --status                      # Show what's running
@@ -262,6 +446,8 @@ sub parse_args {
     my %opts = (
         port => undef,
         host => undef,
+        model => undef,
+        manage_model => undef,
         list => 0,
         update => 0,
         kill => 0,
@@ -270,6 +456,18 @@ sub parse_args {
         status => 0,
         simulate => undef,
         sim_ssd_free => undef,
+        tags => [],
+        gtag_ops => [],
+        tag_rename => undef,
+        tag_desc => undef,
+        taglist => 0,
+        note_edit => 0,
+        note_str => undef,
+        note_del => 0,
+        mmproj => undef,
+        no_mmproj => 0,
+        rm_mmproj => 0,
+        list_mmproj => 0,
     );
     my @llama_args;
     my $in_llama_args = 0;
@@ -292,6 +490,8 @@ sub parse_args {
         	usage(); exit;
 		} elsif ($arg eq '-m' || $arg eq '--model') {
             $opts{model} = shift @ARGV;
+        } elsif ($arg eq '-M' || $arg eq '--manage') {
+            $opts{manage_model} = shift @ARGV;
         } elsif ($arg eq '-l' || $arg eq '--list') {
             $opts{list} = 1;
         } elsif ($arg eq '-u' || $arg eq '--update') {
@@ -303,6 +503,32 @@ sub parse_args {
             $opts{kill} = 1;
         } elsif ($arg eq '--status' || $arg eq '--stat' || $arg eq '--st') {
             $opts{status} = 1;
+        } elsif ($arg eq '-t' || $arg eq '--tag') {
+            my $tag_str = shift @ARGV;
+            my @tags = split /[\s,]+/, $tag_str;
+            push @{$opts{tags}}, @tags;
+        } elsif ($arg eq '--gtag') {
+            push @{$opts{gtag_ops}}, shift @ARGV;
+        } elsif ($arg eq '--tag-list' || $arg eq '--taglist' || $arg eq '--tlist' || $arg eq '--tl') {
+            $opts{taglist} = 1;
+        } elsif ($arg eq '--tag-rename' || $arg eq '--tagrename' || $arg eq '--tren' || $arg eq '--tr') {
+            $opts{tag_rename} = shift @ARGV;
+        } elsif ($arg eq '--tag-desc' || $arg eq '--tagdesc' || $arg eq '--tdesc' || $arg eq '--td') {
+            $opts{tag_desc} = shift @ARGV;
+        } elsif ($arg eq '--note-edit' || $arg eq '--noteedit' || $arg eq '--note' || $arg eq '--ne') {
+            $opts{note_edit} = 1;
+        } elsif ($arg eq '--note-str' || $arg eq '--notestr' || $arg eq '--nstr' || $arg eq '--ns') {
+            $opts{note_str} = shift @ARGV;
+        } elsif ($arg eq '--note-del' || $arg eq '--notedel' || $arg eq '--ndel' || $arg eq '--nd') {
+            $opts{note_del} = 1;
+        } elsif ($arg eq '--mmproj') {
+            $opts{mmproj} = shift @ARGV;
+        } elsif ($arg eq '--no-mmproj') {
+            $opts{no_mmproj} = 1;
+        } elsif ($arg eq '--rm-mmproj') {
+            $opts{rm_mmproj} = 1;
+        } elsif ($arg eq '--list-mmproj' || $arg eq '--lmm') {
+            $opts{list_mmproj} = 1;
         } elsif ($arg eq '--simulate') {
             $opts{simulate} = shift @ARGV;
         } elsif ($arg eq '--sim-ssd-free') {
@@ -339,13 +565,13 @@ sub load_config {
         $json =~ s|//.*$||gm;
 
         my $config = decode_json($json);
-        $config->{stats_file} = glob $config->{stats_file} if $config->{stats_file}//0;
+        $config->{stats_file} = glob($config->{stats_file}) if ($config->{stats_file} // 0);
         $config->{stats_file} //= "$config_dir/stats.json";
-        $config->{hdd_path} = glob $config->{hdd_path} if $config->{hdd_path}//0;
-        $config->{ssd_path} = glob $config->{ssd_path} if $config->{ssd_path}//0;
-        $config->{pid_dir} = glob $config->{pid_dir} if $config->{pid_dir}//0;
+        $config->{hdd_path} = glob($config->{hdd_path}) if ($config->{hdd_path} // 0);
+        $config->{ssd_path} = glob($config->{ssd_path}) if ($config->{ssd_path} // 0);
+        $config->{pid_dir} = glob($config->{pid_dir}) if ($config->{pid_dir} // 0);
         $config->{pid_dir} //= "/tmp/$progname";
-        $config->{server_binary} = glob $config->{server_binary} if $config->{server_binary}//'llama-server';
+        $config->{server_binary} = glob($config->{server_binary}) if ($config->{server_binary} // 'llama-server');
         return $config;
     }
 
@@ -359,6 +585,14 @@ sub load_config {
         default_host => $def_host,
         stats_file => "$config_dir/stats.json",
         pid_dir => "/tmp/$progname",
+        known_tags => {
+            AU => "Audio/speech capable",
+            IMG => "Image/vision capable",
+            ABL => "Abliterated/uncensored",
+            CODE => "Code-specialized",
+            CHAT => "Chat-optimized",
+            TOOL => "Tool-use capable",
+        },
         global_llama_args => [
             '--flash-attn',
             '-ngl', '80',
@@ -401,6 +635,16 @@ sub load_config {
 
 		  // Minimum free space to maintain on SSD (GB)
 		  "ssd_min_free_gb" : 30,
+
+		  // Known tags (global registry)
+		  "known_tags" : {
+		    "AU" : "Audio/speech capable",
+		    "IMG" : "Image/vision capable",
+		    "ABL" : "Abliterated/uncensored",
+		    "CODE" : "Code-specialized",
+		    "CHAT" : "Chat-optimized",
+		    "TOOL" : "Tool-use capable"
+		  },
 
 		  // llama.cpp server binary name/path
 		  "server_binary" : "llama-server",
@@ -479,7 +723,7 @@ sub load_stats {
 
 sub write_stats {
     my $config = load_config();
-    
+
     # Write the GLOBAL $stats that's been modified in memory
     open my $fh, '>', $config->{stats_file} or do {
         serr(0, "Can't write stats: $!");
@@ -492,9 +736,18 @@ sub write_stats {
     $stats_dirty = 0;
 }
 
+sub save_config {
+    my $config = shift;
+
+    open my $fh, '>', $config_file or die "Can't write config: $!";
+    my $json_text = JSON::XS->new->pretty->canonical->encode($config);
+    print $fh $json_text;
+    close $fh;
+}
+
 sub scan_models {
     my $config = shift;
-    
+
     # Load into global if not already loaded
     $stats //= load_stats($config);
 
@@ -509,6 +762,8 @@ sub scan_models {
 
         find(sub {
             return unless -f && /\.gguf$/i;
+            # Skip mmproj files - they're not models
+            return if /mmproj/i;
             my $full_path = $File::Find::name;
             say "$full_path" if $verbose;
             my $key = basename($full_path);
@@ -532,7 +787,7 @@ sub scan_models {
     }
 
     # Write updated stats
-    open my $fh, '>', $config->{stats_file} or die "Can't write stats ($config->{stats_file}): $!";
+    open my $fh, '>', $config->{stats_file} or die "Can't write stats ($$config{stats_file}): $!";
     print $fh JSON::XS->new->pretty->encode($stats);
     close $fh;
 }
@@ -556,12 +811,12 @@ sub find_model {
     # Try exact match first
     if ($stats->{$model_name}) {
         my $locs = $stats->{$model_name}{locations} // [];
-        
+
         # Check actual filesystem for SSD presence (stats might be stale)
         my $ssd_path = $config->{ssd_path} . '/' . $model_name;
         my $has_ssd_file = -f $ssd_path;
         my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
-        
+
         # Update stats if we found SSD file that's not in stats
         if ($has_ssd_file && !$has_ssd_stat) {
             push @$locs, 'ssd';
@@ -569,11 +824,11 @@ sub find_model {
             $stats->{$model_name}{path} = $ssd_path;
             $stats_dirty = 1;
         }
-        
+
         # Prefer SSD if available
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
         my $path = $has_ssd_file ? $ssd_path : $stats->{$model_name}{path};
-        
+
         return {
             path => $path,
             location => $preferred,
@@ -592,12 +847,12 @@ sub find_model {
     } elsif (@matches == 1) {
         my $key = $matches[0];
         my $locs = $stats->{$key}{locations} // [];
-        
+
         # Check actual filesystem for SSD presence
         my $ssd_path = $config->{ssd_path} . '/' . $key;
         my $has_ssd_file = -f $ssd_path;
         my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
-        
+
         # Update stats if we found SSD file that's not in stats
         if ($has_ssd_file && !$has_ssd_stat) {
             push @$locs, 'ssd';
@@ -605,10 +860,10 @@ sub find_model {
             $stats->{$key}{path} = $ssd_path;
             $stats_dirty = 1;
         }
-        
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
         my $path = $has_ssd_file ? $ssd_path : $stats->{$key}{path};
-        
+
         return {
             path => $path,
             location => $preferred,
@@ -631,12 +886,12 @@ sub find_model {
         say "${gre}Using highest-ranked: $chosen$rst";
 
         my $locs = $stats->{$chosen}{locations} // [];
-        
+
         # Check actual filesystem for SSD presence
         my $ssd_path = $config->{ssd_path} . '/' . $chosen;
         my $has_ssd_file = -f $ssd_path;
         my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
-        
+
         # Update stats if we found SSD file that's not in stats
         if ($has_ssd_file && !$has_ssd_stat) {
             push @$locs, 'ssd';
@@ -644,10 +899,10 @@ sub find_model {
             $stats->{$chosen}{path} = $ssd_path;
             $stats_dirty = 1;
         }
-        
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : $locs->[0] // 'unknown';
+
+        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
         my $path = $has_ssd_file ? $ssd_path : $stats->{$chosen}{path};
-        
+
         return {
             path => $path,
             location => $preferred,
@@ -700,10 +955,10 @@ sub should_cache_to_ssd {
 
 sub fork_ssd_copy {
     my ($config, $model_info, $stats) = @_;
-    
+
     my $src = $model_info->{path};
     my $dst = $config->{ssd_path} . '/' . basename($src);
-    
+
     # Check if already exists on SSD
     if (-f $dst) {
         say "${gre}Model already cached on SSD: $dst$rst" if $verbose;
@@ -777,7 +1032,7 @@ sub start_server {
         $stats->{$model_key}{total_runtime_seconds} += $runtime_seconds;
         $stats->{$model_key}{last_runtime_seconds} = $runtime_seconds;
         $stats_dirty = 1;
-        
+
         say "${gre}Runtime logged: ${runtime_seconds}s$rst" if $verbose;
     }
 
@@ -966,15 +1221,451 @@ sub edit_config {
 	system($editor, $config_file);
 }
 
+sub get_known_tags {
+    my $config = shift;
+    return $config->{known_tags} || {};
+}
+
+sub add_model_tag {
+    my ($stats, $model_key, $tag, $known_tags) = @_;
+
+    # Normalize tag
+    $tag = uc($tag);
+    $tag =~ s/^\s+|\s+$//g;
+
+    # Validate tag name
+    if ($tag =~ /[\s,]/) {
+        say "${c_err}Invalid tag name '$tag' (no spaces or commas allowed)$rst";
+        return;
+    }
+
+    # Check if known
+    if (!exists $known_tags->{$tag}) {
+        my @suggestions = suggest_similar_tags($tag, $known_tags);
+        say "${c_warn}$tag is not a known tag.$rst";
+        if (@suggestions) {
+            say "  Did you mean: " . join(', ', map { "${c_attn}$_$rst" } @suggestions) . "?";
+        }
+        say "  Use ${c_attn}--gtag $tag:\"Description\"$rst to add $tag as a new tag first.";
+        exit 1;
+    }
+
+    # Initialize tags array if needed
+    $stats->{$model_key}{tags} ||= [];
+
+    # Add if not already present
+    my $tags = $stats->{$model_key}{tags};
+    if (!grep { $_ eq $tag } @$tags) {
+        push @$tags, $tag;
+        @$tags = sort @$tags;  # Keep sorted
+        $stats_dirty = 1;
+        say "${c_attn}Added tag $tag to $model_key$rst" if $verbose;
+    } else {
+        say "${c_warn}Tag $tag already present on $model_key$rst" if $verbose;
+    }
+}
+
+sub remove_model_tag {
+    my ($stats, $model_key, $tag) = @_;
+
+    # Normalize tag
+    $tag = uc($tag);
+    $tag =~ s/^\s+|\s+$//g;
+
+    my $tags = $stats->{$model_key}{tags} || [];
+    my $before_count = scalar @$tags;
+
+    @$tags = grep { $_ ne $tag } @$tags;
+    $stats->{$model_key}{tags} = $tags;
+
+    if (scalar @$tags < $before_count) {
+        $stats_dirty = 1;
+        say "${c_attn}Removed tag $tag from $model_key$rst" if $verbose;
+    } else {
+        say "${c_warn}Tag $tag was not present on $model_key$rst" if $verbose;
+    }
+}
+
+sub manage_global_tag {
+    my ($config, $op) = @_;
+
+    if ($op =~ /^-(.+)$/) {
+        # Remove tag
+        my $tag = uc($1);
+        if (exists $config->{known_tags}{$tag}) {
+            delete $config->{known_tags}{$tag};
+            save_config($config);
+            say "${c_attn}Removed $tag from global tag registry$rst";
+        } else {
+            say "${c_warn}Tag $tag not in registry$rst";
+        }
+    } elsif ($op =~ /^([^:]+):(.+)$/) {
+        # Add/update tag with description
+        my ($tag, $desc) = (uc($1), $2);
+        $tag =~ s/^\s+|\s+$//g;
+        $desc =~ s/^\s+|\s+$//g;
+
+        if ($tag =~ /[\s,]/) {
+            say "${c_err}Invalid tag name '$tag' (no spaces or commas allowed)$rst";
+            return;
+        }
+
+        $config->{known_tags}{$tag} = $desc;
+        save_config($config);
+        say "${c_attn}Added/updated tag $tag: $desc$rst";
+    } else {
+        say "${c_err}Invalid --gtag format. Use: TAG:DESCRIPTION or -TAG$rst";
+        exit 1;
+    }
+}
+
+sub rename_global_tag {
+    my ($config, $stats, $rename_spec) = @_;
+
+    unless ($rename_spec =~ /^([^:]+):([^:]+)$/) {
+        say "${c_err}Invalid rename format. Use: OLD:NEW$rst";
+        exit 1;
+    }
+
+    my ($old_tag, $new_tag) = (uc($1), uc($2));
+    $old_tag =~ s/^\s+|\s+$//g;
+    $new_tag =~ s/^\s+|\s+$//g;
+
+    if (!exists $config->{known_tags}{$old_tag}) {
+        say "${c_err}Tag $old_tag not found in registry$rst";
+        exit 1;
+    }
+
+    # Update registry
+    $config->{known_tags}{$new_tag} = $config->{known_tags}{$old_tag};
+    delete $config->{known_tags}{$old_tag};
+    save_config($config);
+
+    # Update all models
+    my $count = 0;
+    for my $model_key (keys %$stats) {
+        my $tags = $stats->{$model_key}{tags} || [];
+        for my $i (0 .. $#$tags) {
+            if ($tags->[$i] eq $old_tag) {
+                $tags->[$i] = $new_tag;
+                $count++;
+            }
+        }
+        @$tags = sort @$tags if @$tags;
+    }
+
+    $stats_dirty = 1 if $count > 0;
+    say "${c_attn}Renamed $old_tag → $new_tag across $count model(s)$rst";
+}
+
+sub update_tag_description {
+    my ($config, $desc_spec) = @_;
+
+    unless ($desc_spec =~ /^([^:]+):(.+)$/) {
+        say "${c_err}Invalid format. Use: TAG:DESCRIPTION$rst";
+        exit 1;
+    }
+
+    my ($tag, $desc) = (uc($1), $2);
+    $tag =~ s/^\s+|\s+$//g;
+    $desc =~ s/^\s+|\s+$//g;
+
+    if (!exists $config->{known_tags}{$tag}) {
+        say "${c_err}Tag $tag not found in registry$rst";
+        exit 1;
+    }
+
+    $config->{known_tags}{$tag} = $desc;
+    save_config($config);
+    say "${c_attn}Updated description for $tag: $desc$rst";
+}
+
+sub list_known_tags {
+    my $config = shift;
+
+    my $known_tags = get_known_tags($config);
+
+    unless (keys %$known_tags) {
+        say "${c_warn}No tags in global registry$rst";
+        return;
+    }
+
+    say "${whi}${inv} Known Tags $rst\n";
+
+    my $tb = Text::Table->new(
+        { title => "Tag", align => 'left' },
+        \"  ",
+        { title => "Description", align => 'left' },
+    );
+
+    for my $tag (sort keys %$known_tags) {
+        $tb->add("${c_tag}$tag$rst", $known_tags->{$tag});
+    }
+
+    print $tb;
+}
+
+sub suggest_similar_tags {
+    my ($tag, $known_tags) = @_;
+
+    my @suggestions;
+    for my $known (keys %$known_tags) {
+        my $dist = levenshtein($tag, $known);
+        push @suggestions, { tag => $known, dist => $dist } if $dist <= 2;
+    }
+
+    @suggestions = sort { $a->{dist} <=> $b->{dist} } @suggestions;
+    return map { $_->{tag} } @suggestions;
+}
+
+sub levenshtein {
+    my ($s1, $s2) = @_;
+    my @s1 = split //, $s1;
+    my @s2 = split //, $s2;
+
+    my @d;
+    $d[$_][0] = $_ for (0 .. @s1);
+    $d[0][$_] = $_ for (0 .. @s2);
+
+    for my $i (1 .. @s1) {
+        for my $j (1 .. @s2) {
+            $d[$i][$j] = $s1[$i-1] eq $s2[$j-1] ? $d[$i-1][$j-1] :
+                         1 + (
+                             $d[$i-1][$j] < $d[$i][$j-1] ?
+                             ($d[$i-1][$j] < $d[$i-1][$j-1] ? $d[$i-1][$j] : $d[$i-1][$j-1]) :
+                             ($d[$i][$j-1] < $d[$i-1][$j-1] ? $d[$i][$j-1] : $d[$i-1][$j-1])
+                         );
+        }
+    }
+
+    return $d[@s1][@s2];
+}
+
+sub edit_model_note {
+    my ($stats, $model_key, $editor) = @_;
+
+    my $note = $stats->{$model_key}{note} || '';
+
+    # Create temp file
+    my $tmpfname = "/tmp/llama-pack-note-$$.tmp";
+
+    my $omask = umask 0177;
+    write_text($tmpfname, $note);
+    umask $omask;
+
+    # Edit
+    system($editor, $tmpfname);
+
+    # Read back
+    my $newnote = read_text($tmpfname);
+    $newnote =~ s/(\A\s+)|(\s+\z)//sg;
+    $note =~ s/(\A\s+)|(\s+\z)//sg;
+
+    unlink $tmpfname;
+
+    if ($newnote eq $note) {
+        say "${c_warn}No changes made$rst";
+    } elsif ($newnote =~ /\A\s*\z/s) {
+        delete $stats->{$model_key}{note};
+        $stats_dirty = 1;
+        say "${c_attn}Note deleted$rst";
+    } else {
+        $stats->{$model_key}{note} = $newnote;
+        $stats_dirty = 1;
+        say "${c_attn}Note updated$rst";
+    }
+}
+
+sub set_model_note {
+    my ($stats, $model_key, $note_str) = @_;
+
+    $note_str =~ s/(\A\s+)|(\s+\z)//sg;
+
+    if ($note_str =~ /\A\s*\z/s) {
+        delete $stats->{$model_key}{note};
+        say "${c_warn}Empty note, deleted$rst";
+    } else {
+        $stats->{$model_key}{note} = $note_str;
+        say "${c_attn}Note set$rst";
+    }
+
+    $stats_dirty = 1;
+}
+
+sub delete_model_note {
+    my ($stats, $model_key) = @_;
+
+    if (exists $stats->{$model_key}{note}) {
+        delete $stats->{$model_key}{note};
+        $stats_dirty = 1;
+        say "${c_attn}Note deleted$rst";
+    } else {
+        say "${c_warn}No note to delete$rst";
+    }
+}
+
+sub show_model_details {
+    my ($config, $stats, $model_name) = @_;
+
+    my $model_info = find_model($config, $stats, $model_name);
+    unless ($model_info) {
+        serr(0, "Model '$model_name' not found.");
+        exit 1;
+    }
+
+    my $model_key = basename($model_info->{path});
+    my $mstats = $stats->{$model_key} || {};
+
+    say "${whi}${inv} Model Details $rst\n";
+
+    say "${c_attn}Name:$rst $cya$model_key$rst";
+    say "${c_attn}Path:$rst $$mstats{path}" if $mstats->{path};
+
+    if ($mstats->{size_bytes}) {
+        say "${c_attn}Size:$rst " . format_size($mstats->{size_bytes});
+    }
+
+    my $locs = $model_info->{locations} || [];
+    if (@$locs) {
+        say "${c_attn}Locations:$rst " . join(', ', @$locs);
+    }
+
+    my $tags = $mstats->{tags} || [];
+    if (@$tags) {
+        say "${c_attn}Tags:$rst ${c_tag}" . join(', ', @$tags) . $rst;
+    }
+
+    if ($mstats->{mmproj}) {
+        my $mmproj_path = find_mmproj($config, $mstats->{mmproj});
+        if ($mmproj_path) {
+            say "${c_attn}MMPROJ:$rst $$mstats{mmproj} (found: $mmproj_path)";
+        } else {
+            say "${c_attn}MMPROJ:$rst $$mstats{mmproj} ${c_warn}(not found)$rst";
+        }
+    }
+
+    if ($mstats->{last_used}) {
+        say "${c_attn}Last Used:$rst $$mstats{last_used}";
+    }
+
+    if ($mstats->{total_uses}) {
+        say "${c_attn}Total Uses:$rst $$mstats{total_uses}";
+    }
+
+    if ($mstats->{total_runtime_seconds}) {
+        say "${c_attn}Total Runtime:$rst " . format_time($mstats->{total_runtime_seconds});
+    }
+
+    if ($mstats->{last_runtime_seconds}) {
+        say "${c_attn}Last Runtime:$rst " . format_time($mstats->{last_runtime_seconds});
+    }
+
+    # Calculate mtime range for ranking
+    my ($newest_mtime, $oldest_mtime) = (0, time);
+    for my $model (keys %$stats) {
+        my $mtime = $stats->{$model}{mtime} || 0;
+        $newest_mtime = $mtime if $mtime > $newest_mtime;
+        $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
+    }
+
+    my $rank = rank_model($mstats, $newest_mtime, $oldest_mtime);
+    say "${c_attn}Rank:$rst " . sprintf("%.1f", $rank);
+
+    if ($mstats->{mtime}) {
+        my $mtime_obj = gmtime($mstats->{mtime});
+        say "${c_attn}File Modified:$rst " . $mtime_obj->strftime('%Y-%m-%d %H:%M:%S');
+    }
+
+    if ($mstats->{note}) {
+        say "\n${c_attn}Notes:$rst";
+        my $note = $mstats->{note};
+        $note =~ s/^/  /mg;  # Indent
+        say $note;
+    }
+}
+
+sub find_mmproj {
+    my ($config, $mmproj_name) = @_;
+
+    # Try SSD first, then HDD
+    for my $location (qw(ssd hdd)) {
+        my $path = $config->{"${location}_path"};
+        next unless -d $path;
+
+        # Try exact filename match
+        my $full_path = "$path/$mmproj_name";
+        return $full_path if -f $full_path;
+
+        # Try pattern match
+        opendir my $dh, $path or next;
+        my @matches = grep { /\Q$mmproj_name\E/i && /mmproj/i && /\.gguf$/i } readdir($dh);
+        closedir $dh;
+
+        if (@matches) {
+            return "$path/$matches[0]";
+        }
+    }
+
+    return undef;
+}
+
+sub list_mmproj {
+    my $config = shift;
+
+    my @mmproj_files;
+
+    for my $location (qw(ssd hdd)) {
+        my $path = $config->{"${location}_path"};
+        next unless -d $path;
+
+        opendir my $dh, $path or next;
+        my @files = grep { /mmproj/i && /\.gguf$/i && -f "$path/$_" } readdir($dh);
+        closedir $dh;
+
+        for my $file (@files) {
+            push @mmproj_files, {
+                name => $file,
+                location => $location,
+                path => "$path/$file",
+                size => -s "$path/$file",
+            };
+        }
+    }
+
+    unless (@mmproj_files) {
+        say "${c_warn}No mmproj files found$rst";
+        return;
+    }
+
+    say "${whi}${inv} MMPROJ Files $rst\n";
+
+    my $tb = Text::Table->new(
+        { title => "File", align => 'left' },
+        \"  ",
+        { title => "Location", align => 'left' },
+        \"  ",
+        { title => "Size", align => 'right' },
+    );
+
+    for my $file (sort { $a->{name} cmp $b->{name} } @mmproj_files) {
+        my $loc_str = $file->{location} eq 'ssd' ? "${bcya}SSD${rst}" : "${yel}HDD${rst}";
+        my $size_str = format_size($file->{size});
+        $tb->add("${cya}$$file{name}${rst}", $loc_str, $size_str);
+    }
+
+    print $tb;
+    say "\n${gra}Total: " . scalar(@mmproj_files) . " file(s)$rst";
+}
+
 sub list_models {
     my $config = shift;
-    
+
     # Get terminal width
-    my $term_width = eval { 
+    my $term_width = eval {
         require Term::Size;
-        (Term::Size::chars())[0] // $ENV{COLUMNS} // 79;
-    } || $ENV{COLUMNS} || 79;
-    
+        (Term::Size::chars())[0] // ($ENV{COLUMNS} // 79);
+    } || ($ENV{COLUMNS} // 79);
+
     # Use global $stats if loaded, otherwise load it
     my $stats_to_use = $stats // load_stats($config);
 
@@ -992,19 +1683,19 @@ sub list_models {
     } keys %$stats_to_use;
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
-    
+
     # Determine if we need to wrap based on longest model name + stats width
     my $longest_model = 0;
     for my $model (@models) {
         my $len = length($model);
         $longest_model = $len if $len > $longest_model;
     }
-    
-    # Stats columns: Rank(6) + SSD(5) + HDD(5) + Last(12) + Uses(6) + Mtime(12) + spacing = ~55
-    my $stats_width = 55;
+
+    # Stats columns: Rank(6) + SSD(5) + HDD(5) + Last(12) + Uses(6) + Mtime(12) + Tags(20) + spacing = ~75
+    my $stats_width = 75;
     my $need_wrap = ($longest_model + $stats_width) > $term_width;
     my $wrapped_indent = ' ';
-    
+
     my $tb;
     if ($need_wrap) {
         # Wrapped mode - no "Model" header, just indented stats columns
@@ -1021,6 +1712,8 @@ sub list_models {
             { title => "Uses", align => 'right', align_title => 'right' },
             \"  ",
             { title => "Mtime", align => 'left' },
+            \"  ",
+            { title => "Tags", align => 'left' },
         );
     } else {
         # Normal table with Model column
@@ -1038,17 +1731,22 @@ sub list_models {
             { title => "Uses", align => 'right', align_title => 'right' },
             \"  ",
             { title => "Mtime", align => 'left' },
+            \"  ",
+            { title => "Tags", align => 'left' },
         );
     }
-    
+
     my @ssd_only_models;
-    
+
+    # Calculate available width for tags
+    my $tags_col_width = 20;  # Default truncate width for tags
+
     for my $model (@models) {
         my $mstats = $stats_to_use->{$model};
         my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
         my $uses = $mstats->{total_uses} // 0;
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
-        
+
         # Format mtime
         my $mtime_str = 'unknown';
         if ($mstats->{mtime}) {
@@ -1060,23 +1758,23 @@ sub list_models {
         my $locs = $mstats->{locations} // [];
         my $on_ssd = grep { $_ eq 'ssd' } @$locs;
         my $on_hdd = grep { $_ eq 'hdd' } @$locs;
-        
+
         # Check if file still exists (for stats-only detection)
         my $stored_path = $mstats->{path};
         my $exists_on_disk = $stored_path && -f $stored_path;
-        
+
         # Track SSD-only models (dangerous state)
         if ($on_ssd && !$on_hdd && $exists_on_disk) {
             push @ssd_only_models, $stored_path;
         }
-        
+
         # Check if it should be cached
         my $should_cache = should_cache_to_ssd($mstats);
 
         # Build separate SSD and HDD display strings
         my $ssd_str = '';
         my $hdd_str = '';
-        
+
         if (!$exists_on_disk) {
             # Model deleted from disk but stats remain
             $ssd_str = "${rst}${bro}st${rst}";
@@ -1090,25 +1788,36 @@ sub list_models {
             } elsif (!$on_ssd && $should_cache) {
                 $ssd_str = "${yel}{SSD}${rst}";
             }
-            
+
             # HDD status
             if ($on_hdd) {
                 $hdd_str = "${yel}HDD${rst}";
             }
-            
+
             # Special case: only on SSD (dangerous)
             if ($on_ssd && !$on_hdd) {
                 $hdd_str = "${red}***${rst}";
             }
         }
 
+        # Format tags
+        my $tags = $mstats->{tags} || [];
+        my $tags_str = '';
+        if (@$tags) {
+            my $tags_display = join(' ', @$tags);
+            if (length($tags_display) > $tags_col_width) {
+                $tags_display = substr($tags_display, 0, $tags_col_width - 3) . '...';
+            }
+            $tags_str = "${c_tag}$tags_display$rst";
+        }
+
         if ($need_wrap) {
             # Model name on its own line, then stats on next line with indent
             say "$cya$model$rst";
-            $tb->add('', $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+            $tb->add('', $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}", $tags_str);
         } else {
             # Normal single-line display
-            $tb->add("$cya$model$rst", $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+            $tb->add("$cya$model$rst", $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}", $tags_str);
         }
     }
 
@@ -1116,16 +1825,16 @@ sub list_models {
     if ($need_wrap) {
         # Print title first
         print $tb->title;
-        
+
         # Get table body rows
         my @tb_rows = split /\n/, $tb->body;
-        
+
         # Print each model name followed by its stats row
         for my $i (0 .. $#models) {
             say "$cya$models[$i]$rst";
             say $tb_rows[$i] if $i < @tb_rows;
         }
-        
+
         # Print title at bottom
         print $tb->title;
     } else {
@@ -1133,7 +1842,7 @@ sub list_models {
         print $tb;
         print $tb->title;
     }
-    
+
     # Build and wrap key intelligently
     my @key_items = (
         "Key:",
@@ -1144,35 +1853,35 @@ sub list_models {
         "${rst}${bro}st${rst}${gra}=stats only",
         "${red}***${rst}${gra}=SSD only!",
     );
-    
+
     # Build key with intelligent wrapping
     my $key_line = "${gra}";
     my $current_len = 0;
     my $first_item = 1;
-    
+
     for my $item (@key_items) {
         # Strip color codes to measure actual length
         my $item_plain = $item;
         $item_plain =~ s/\e\[[0-9;]+m//g;
         my $item_len = length($item_plain);
-        
+
         my $separator = $first_item ? "" : ", ";
         my $sep_len = length($separator);
-        
+
         if ($current_len > 0 && ($current_len + $sep_len + $item_len) > $term_width) {
             # Wrap to next line
             $key_line .= "\n${gra}     ";  # 5-space indent
             $current_len = 5;
             $separator = "";
         }
-        
+
         $key_line .= $separator . $item;
         $current_len += $sep_len + $item_len;
         $first_item = 0;
     }
-    
+
     say $key_line . $rst;
-    
+
     # Warn about SSD-only models
     if (@ssd_only_models) {
         say "\n${red}${inv} WARNING $rst ${yel}@{[scalar @ssd_only_models]} model(s) only on SSD (not on HDD)$rst";
@@ -1214,7 +1923,7 @@ sub run_simulation {
 
         my $preset = $sims->{$sim_name};
         $pattern = $preset->{pattern};
-        $ssd_free_gb = $opts->{sim_ssd_free} // $preset->{ssd_free_gb} // 100;
+        $ssd_free_gb = $opts->{sim_ssd_free} // ($preset->{ssd_free_gb} // 100);
         $description = $preset->{description} // $sim_name;
     }
 
@@ -1280,7 +1989,7 @@ sub parse_simulation_pattern {
 
     my %model_registry;
     my @timeline;
-    
+
     # Use global $stats if available, otherwise load
     my $stats_to_use = $stats // load_stats($config);
 
@@ -1563,6 +2272,12 @@ sub serr {
     say STDERR a24bg(100, 0, 0) . $whi, @msg, $rst;
 }
 
+sub swarn {
+    my ($level, @msg) = @_;
+    return if $verbose < $level;
+    say STDERR $rst, a24bg(255, 255, 90) . $bla, @msg, $rst;
+}
+
 sub init_colors {
     if (-t STDOUT) {
         ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra) =
@@ -1573,11 +2288,22 @@ sub init_colors {
             map { "\e[${_}m" } (90..97);
         $rst = "\e[0m";
         $inv = "\e[7m";
+
+        # Additional color variables
+        $c_warn = $yel;
+        $c_err = $bred;
+        $c_attn = $bcya;
+        $c_attn_ctx = $cya;
+        $c_sel = $bmag;
+        $c_tag = $gra;
     } else {
         ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra) = ('') x 8;
         ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra) = ('') x 8;
         ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi) = ('') x 8;
         $rst = $inv = '';
+
+        # Additional color variables
+        $c_warn = $c_err = $c_attn = $c_attn_ctx = $c_sel = $c_tag = '';
     }
 }
 
