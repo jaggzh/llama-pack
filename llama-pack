@@ -577,7 +577,7 @@ sub load_config {
 
     # Create default config
     my $config = {
-        ssd_path => "$ENV{HOME}/models/ssd",
+        ssd_path => "/mnt/ssd/share/models/llm",
         hdd_path => "$ENV{HOME}/models/hdd",
         ssd_min_free_gb => 30,
         server_binary => 'llama-server',
@@ -594,7 +594,7 @@ sub load_config {
             TOOL => "Tool-use capable",
         },
         global_llama_args => [
-            '--flash-attn',
+            '--flash-attn', 'on',
             '-ngl', '80',
             '-c', '15000',
             '--jinja',
