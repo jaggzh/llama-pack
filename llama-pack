@@ -2079,7 +2079,6 @@ sub list_models {
     my $tb;
     @wrapped_indent = (' ') if $need_wrap;
     $tb = Text::Table->new(@wrapped_indent, @cols);
-    }
 
     my @ssd_only_models;
     my $tags_col_width = 18;
