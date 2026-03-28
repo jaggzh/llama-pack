@@ -286,6 +286,34 @@ sub main {
     $stats->{$model_key} //= {};
     my $mstats = $stats->{$model_key};
 
+	# --maxctx calculation request
+    if ($opts->{maxctx}) {
+       # Optional: probe on demand if metadata is missing
+        if (!$mstats->{gguf}) {
+            say "${yel}No cached GGUF metadata for $model_key; probing now...$rst" if $verbose;
+            my $meta = probe_model_metadata($config, $model_info->{path});
+            if ($meta) {
+                $mstats->{gguf} = $meta;
+                $stats_dirty = 1;
+            }
+        }
+
+        my $ctx = estimate_max_context($mstats, $config, $opts);
+        my $params = format_params_b($mstats->{gguf}{params_b});
+        my $train_ctx = $mstats->{gguf}{train_ctx} // '-';
+        my $vram = effective_vram_gib($config, $opts);
+
+        say "${c_attn}Model:$rst $model_key";
+        say "${c_attn}Params:$rst " . ($params || '-');
+        say "${c_attn}Train Ctx:$rst $train_ctx";
+        say "${c_attn}Max Ctx @ ${vram}GiB:$rst " . (defined $ctx ? $ctx : '-');
+
+        exit 0;
+    }
+
+
+
+
     # Determine which args to use
     my @final_llama_args;
     if (@$llama_args && (!$mstats->{llama_args} || $opts->{store})) {
