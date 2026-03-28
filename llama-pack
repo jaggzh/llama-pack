@@ -914,8 +914,10 @@ sub probe_model_metadata {
             $value =~ s/^\s+|\s+$//g;
             $value =~ s/^'(.*)'$/$1/;
             $kv{$key} = $value;
-            if ($key =~ /^tokenizer\.ggml\.(tokens|token_type)$/ && $line =~ /\|\s*(\d+)\s*\|/) {
-                $kv{$key . '.count'} = $2 + 0;
+            if ($key =~ /^tokenizer\.ggml\.(tokens|token_type)$/) {
+            	if ($line =~ /\|\s*(\d+)\s*\|/) {
+					$kv{$key . '.count'} = $1 + 0;
+				}
             }
             next;
         }
