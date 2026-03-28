@@ -72,6 +72,12 @@ sub main {
     $opts->{port} //= $config->{default_port} // $def_port;
     $opts->{host} //= $config->{default_host} // $def_host;
 
+    if ($opts->{rename}) {
+        $stats = load_stats($config);
+        rename_model_entry($config, $stats, $opts->{rename});
+        exit 0;
+    }
+
     # Add host/port to llama_args if they weren't already added
     my $has_port = grep { $_ eq '--port' } @$llama_args;
     my $has_host = grep { $_ eq '--host' } @$llama_args;
@@ -81,7 +87,7 @@ sub main {
 
     # Handle commands that don't need model loading
     if ($opts->{list}) {
-        list_models($config);
+        list_models($config, $opts);
         exit 0;
     }
 
@@ -101,8 +107,15 @@ sub main {
     }
 
     if ($opts->{update}) {
-        scan_models($config);
-        say "${gre}Model index updated.$rst";
+        scan_models($config, {
+            update_details => $opts->{update_details},
+            overwrite      => $opts->{overwrite},
+            cache_test     => ($opts->{cache_test} // $config->{cache_test} // 'size'),
+            target_model   => ($opts->{model} // $opts->{manage_model}),
+        });
+        say $opts->{update_details}
+            ? "${gre}Model index and GGUF metadata updated.$rst"
+            : "${gre}Model index updated.$rst";
         exit 0;
     }
 
@@ -255,8 +268,8 @@ sub main {
 
     # Load stats ONCE into global
     swarn 0, "Removed load_stats() from the every-run approach. Need to make sure that was okay.";
-	# We might need to uncomment this, but it's likely claude made this properly only load
-	# stats in paths that need it.
+    # We might need to uncomment this, but it's likely claude made this properly only load
+    # stats in paths that need it.
     # $stats = load_stats($config);
 
     # Find the model (future: check nicknames first)
@@ -354,92 +367,101 @@ sub main {
 }
 
 sub usage {
-	print <<~EOT;
-		$progname: Manage and load LLM models with smart SSD caching.
+    print <<~EOT;
+        $progname: Manage and load LLM models with smart SSD caching.
 
-		RUNNING MODELS:
-		  -m, --model NAME     Load model by name/pattern
-		  -M, --manage NAME    Manage model metadata without loading
-		                       (shows details if no other options)
-		  -p, --port N         Server port (default: $def_port)
-		  --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
-		  --store, --keep      Save model-specific args for future runs
+        RUNNING MODELS:
+          -m, --model NAME     Load model by name/pattern
+          -M, --manage NAME    Manage model metadata without loading
+                               (shows details if no other options)
+          -p, --port N         Server port (default: $def_port)
+          --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
+          --store, --keep      Save model-specific args for future runs
 
-		MANAGING MODELS:
-		  -l, --list           List all models with stats and rankings
-		  -u, --update         Scan directories and update model index
-		  --status, --stat     Show currently running servers
-		  --st
+        MANAGING MODELS:
+          -l, --list           List all models with stats and rankings
+          -u, --update         Scan directories and update model index
+          --uu                 Scan/update and refresh GGUF metadata for all models
+          --overwrite          With --uu, ignore cached metadata and refresh anyway
+          --cache-test SPEC    Metadata invalidation test: size or size,time
+          --maxctx             In -l, show estimated max context for current VRAM budget
+          --vram N             Override planner VRAM budget in GiB (e.g. 23 or 23.5)
+          --rename OLD,NEW     Rename a model on disk and in stats.json
+          --status, --stat     Show currently running servers
+          --st
 
-		TAGS (model-specific):
-		  -t, --tag TAGS       Add/remove tags (e.g., -t au,img or -t au,-abl)
-		                       Space or comma-separated, prefix with - to remove
+        TAGS (model-specific):
+          -t, --tag TAGS       Add/remove tags (e.g., -t au,img or -t au,-abl)
+                               Space or comma-separated, prefix with - to remove
 
-		GLOBAL TAG REGISTRY:
-		  --gtag TAG:DESC      Add tag to global registry
-		  --gtag -TAG          Remove tag from global registry
-		  --tag-list, --taglist, --tlist, --tl
-		                       List all known tags
-		  --tag-rename, --tagrename, --tren, --tr OLD:NEW
-		                       Rename tag everywhere
-		  --tag-desc, --tagdesc, --tdesc, --td TAG:DESC
-		                       Update tag description
+        GLOBAL TAG REGISTRY:
+          --gtag TAG:DESC      Add tag to global registry
+          --gtag -TAG          Remove tag from global registry
+          --tag-list, --taglist, --tlist, --tl
+                               List all known tags
+          --tag-rename, --tagrename, --tren, --tr OLD:NEW
+                               Rename tag everywhere
+          --tag-desc, --tagdesc, --tdesc, --td TAG:DESC
+                               Update tag description
 
-		NOTES (model-specific):
-		  --note-edit, --noteedit, --note, --ne
-		                       Edit note in \$EDITOR
-		  --note-str, --notestr, --nstr, --ns "TEXT"
-		                       Set note from command line
-		  --note-del, --notedel, --ndel, --nd
-		                       Delete note
+        NOTES (model-specific):
+          --note-edit, --noteedit, --note, --ne
+                               Edit note in \$EDITOR
+          --note-str, --notestr, --nstr, --ns "TEXT"
+                               Set note from command line
+          --note-del, --notedel, --ndel, --nd
+                               Delete note
 
-		MMPROJ (multimodal projection files):
-		  --mmproj FILE        Associate mmproj file with model
-		  --no-mmproj          Don't load mmproj for this run
-		  --rm-mmproj          Remove mmproj association from model
-		  --list-mmproj, --lmm List all mmproj files
+        MMPROJ (multimodal projection files):
+          --mmproj FILE        Associate mmproj file with model
+          --no-mmproj          Don't load mmproj for this run
+          --rm-mmproj          Remove mmproj association from model
+          --list-mmproj, --lmm List all mmproj files
 
-		CONFIG:
-		  --ec --ce --edit-config  Edit config: $editor config_file
-		                       (Uses env var \$EDITOR)
+        CONFIG:
+          --ec --ce --edit-config  Edit config: $editor config_file
+                               (Uses env var \$EDITOR)
 
-		KILLING SERVERS:
-		  -k, --kill           Kill server on specified port (use with -p/--port)
-		  --killall, --kall    Kill ALL $progname managed servers
+        KILLING SERVERS:
+          -k, --kill           Kill server on specified port (use with -p/--port)
+          --killall, --kall    Kill ALL $progname managed servers
 
-		SIMULATION:
-		  --simulate NAME      Run named simulation preset from config
-		  --simulate PATTERN   Run custom simulation pattern (contains = or ;)
-		  --sim-ssd-free SIZE  Override SSD free space (e.g. 50g, 100m, 1.5g)
+        SIMULATION:
+          --simulate NAME      Run named simulation preset from config
+          --simulate PATTERN   Run custom simulation pattern (contains = or ;)
+          --sim-ssd-free SIZE  Override SSD free space (e.g. 50g, 100m, 1.5g)
 
-		OTHER:
-		  -v, --verbose        Increase verbosity (use multiple times: -v -v)
-		  -h, --help           This help
-		  --                   Everything after this goes to llama-server
+        OTHER:
+          -v, --verbose        Increase verbosity (use multiple times: -v -v)
+          -h, --help           This help
+          --                   Everything after this goes to llama-server
 
-		EXAMPLES:
-		  $progname -m mymodel                    # Load model with saved args
-		  $progname -m mymodel -- -c 8192         # Override context size once
-		  $progname -m mymodel --store -- -c 8192 # Save new context size
-		  $progname -M mymodel                    # Show model details
-		  $progname -M mymodel -t au,img          # Add tags without loading
-		  $progname -m mymodel -t au -- -c 8192   # Tag and load
-		  $progname --gtag au:"Audio capable"     # Add tag to registry
-		  $progname --tl                          # List known tags
-		  $progname -M mymodel --note             # Edit note in vim
-		  $progname -m gemma3 --mmproj mmproj-gemma3.gguf  # Associate mmproj
-		  $progname -m gemma3 --no-mmproj         # Load without mmproj
-		  $progname --lmm                         # List all mmproj files
-		  $progname -k -p 8080                    # Kill server on port 8080
-		  $progname --killall                     # Kill all running servers
-		  $progname --status                      # Show what's running
-		  $progname --simulate daily_work         # Run simulation preset
-		  $progname --simulate "test:10g=0s/1h,1d/2h" --sim-ssd-free 50g
+        EXAMPLES:
+          $progname -m mymodel                    # Load model with saved args
+          $progname -m mymodel -- -c 8192         # Override context size once
+          $progname -m mymodel --store -- -c 8192 # Save new context size
+          $progname -M mymodel                    # Show model details
+          $progname -M mymodel -t au,img          # Add tags without loading
+          $progname -m mymodel -t au -- -c 8192   # Tag and load
+          $progname --uu                          # Refresh cached GGUF metadata
+          $progname -l --maxctx --vram 23         # Show fit estimate for 23 GiB
+          $progname --rename old.gguf,new.gguf    # Rename model + stats entry
+          $progname --gtag au:"Audio capable"     # Add tag to registry
+          $progname --tl                          # List known tags
+          $progname -M mymodel --note             # Edit note in vim
+          $progname -m gemma3 --mmproj mmproj-gemma3.gguf  # Associate mmproj
+          $progname -m gemma3 --no-mmproj         # Load without mmproj
+          $progname --lmm                         # List all mmproj files
+          $progname -k -p 8080                    # Kill server on port 8080
+          $progname --killall                     # Kill all running servers
+          $progname --status                      # Show what's running
+          $progname --simulate daily_work         # Run simulation preset
+          $progname --simulate "test:10g=0s/1h,1d/2h" --sim-ssd-free 50g
 
-		*Note: Simulation preset names may not contain = or ;
+        *Note: Simulation preset names may not contain = or ;
 
-		CONFIG: $config_file
-		EOT
+        CONFIG: $config_file
+        EOT
 }
 
 sub parse_args {
@@ -450,6 +472,12 @@ sub parse_args {
         manage_model => undef,
         list => 0,
         update => 0,
+        update_details => 0,
+        overwrite => 0,
+        cache_test => undef,
+        maxctx => 0,
+        vram => undef,
+        rename => undef,
         kill => 0,
         kill_all => 0,
         store => 0,
@@ -487,8 +515,8 @@ sub parse_args {
         }
 
         if ($arg eq '-h' || $arg eq '--help') {
-        	usage(); exit;
-		} elsif ($arg eq '-m' || $arg eq '--model') {
+            usage(); exit;
+        } elsif ($arg eq '-m' || $arg eq '--model') {
             $opts{model} = shift @ARGV;
         } elsif ($arg eq '-M' || $arg eq '--manage') {
             $opts{manage_model} = shift @ARGV;
@@ -496,6 +524,19 @@ sub parse_args {
             $opts{list} = 1;
         } elsif ($arg eq '-u' || $arg eq '--update') {
             $opts{update} = 1;
+        } elsif ($arg eq '--uu') {
+            $opts{update} = 1;
+            $opts{update_details} = 1;
+        } elsif ($arg eq '--overwrite') {
+            $opts{overwrite} = 1;
+        } elsif ($arg eq '--cache-test') {
+            $opts{cache_test} = shift @ARGV;
+        } elsif ($arg eq '--maxctx') {
+            $opts{maxctx} = 1;
+        } elsif ($arg eq '--vram') {
+            $opts{vram} = shift @ARGV;
+        } elsif ($arg eq '--rename' || $arg eq '--ren' || $arg eq '--mv') {
+            $opts{rename} = shift @ARGV;
         } elsif ($arg eq '-k' || $arg eq '--kill') {
             $opts{kill} = 1;
         } elsif ($arg eq '--killall' || $arg eq '--kall') {
@@ -572,6 +613,13 @@ sub load_config {
         $config->{pid_dir} = glob($config->{pid_dir}) if ($config->{pid_dir} // 0);
         $config->{pid_dir} //= "/tmp/$progname";
         $config->{server_binary} = glob($config->{server_binary}) if ($config->{server_binary} // 'llama-server');
+        $config->{bin_gguf_dump} = glob($config->{bin_gguf_dump}) if ($config->{bin_gguf_dump} // 0);
+        $config->{bin_gguf_dump} //= 'gguf_dump.py';
+        $config->{cache_test} //= 'size';
+        $config->{planner_vram_gib} //= 0;
+        $config->{planner_margin_mib} //= 768;
+        $config->{planner_ctk} //= 'f16';
+        $config->{planner_ctv} //= 'f16';
         return $config;
     }
 
@@ -581,10 +629,16 @@ sub load_config {
         hdd_path => "$ENV{HOME}/models/hdd",
         ssd_min_free_gb => 30,
         server_binary => 'llama-server',
+        bin_gguf_dump => 'gguf_dump.py',
         default_port => $def_port,
         default_host => $def_host,
         stats_file => "$config_dir/stats.json",
         pid_dir => "/tmp/$progname",
+        cache_test => 'size',
+        planner_vram_gib => 0,
+        planner_margin_mib => 768,
+        planner_ctk => 'f16',
+        planner_ctv => 'f16',
         known_tags => {
             AU => "Audio/speech capable",
             IMG => "Image/vision capable",
@@ -628,70 +682,82 @@ sub load_config {
 
     # Add helpful comments
     my $commented = <<~EOT;
-		{
-		  // Paths to model directories
-		  "ssd_path" : "~/models/ssd",
-		  "hdd_path" : "~/models/hdd",
+        {
+          // Paths to model directories
+          "ssd_path" : "~/models/ssd",
+          "hdd_path" : "~/models/hdd",
 
-		  // Minimum free space to maintain on SSD (GB)
-		  "ssd_min_free_gb" : 30,
+          // Minimum free space to maintain on SSD (GB)
+          "ssd_min_free_gb" : 30,
 
-		  // Known tags (global registry)
-		  "known_tags" : {
-		    "AU" : "Audio/speech capable",
-		    "IMG" : "Image/vision capable",
-		    "ABL" : "Abliterated/uncensored",
-		    "CODE" : "Code-specialized",
-		    "CHAT" : "Chat-optimized",
-		    "TOOL" : "Tool-use capable"
-		  },
+          // Known tags (global registry)
+          "known_tags" : {
+            "AU" : "Audio/speech capable",
+            "IMG" : "Image/vision capable",
+            "ABL" : "Abliterated/uncensored",
+            "CODE" : "Code-specialized",
+            "CHAT" : "Chat-optimized",
+            "TOOL" : "Tool-use capable"
+          },
 
-		  // llama.cpp server binary name/path
-		  "server_binary" : "llama-server",
+          // llama.cpp server binary name/path
+          "server_binary" : "llama-server",
 
-		  // Default host for server (0.0.0.0 for all interfaces)
-		  "default_host" : "127.0.0.1",
+          // Default host for server (0.0.0.0 for all interfaces)
+          "default_host" : "127.0.0.1",
 
-		  // Default port for server
-		  "default_port" : 8080,
+          // Default port for server
+          "default_port" : 8080,
 
-		  // Internal files
-		  "stats_file" : "$config_dir/stats.json",
-		  "pid_dir" : "/tmp/$progname",
+          // GGUF metadata dumper (preferred over launching llama-cli for metadata only)
+          "bin_gguf_dump" : "gguf_dump.py",
 
-		  // Global args passed to ALL models (customize these!)
-		  "global_llama_args" : [
-		    "--flash-attn",
-		    "-ngl", "80",
-		    "-c", "15000",
-		    "--jinja"
-		  ],
+          // Metadata cache invalidation test: "size" or "size,time"
+          "cache_test" : "size",
 
-		  // Simulation presets (see --help for pattern format)
-		  "simulations" : {
-		    "simple" : {
-		      "description" : "Basic cache trigger test - 2 uses within 24h",
-		      "pattern" : "testmodel:10g=0s/5m,1h/5m,25h/5m",
-		      "ssd_free_gb" : 50
-		    },
-		    "daily_work" : {
-		      "description" : "Realistic daily workflow with model switching",
-		      "pattern" : "llama:45g=0s/2h,1d/3h,2d/2h,3d/4h; qwen:30g=0s/30m,12h/1h,1d/30m,2d/1h; gemma:8g=2d/15m,3d/20m",
-		      "ssd_free_gb" : 100
-		    },
-		    "rapid_switch" : {
-		      "description" : "Frequent switching between models",
-		      "pattern" : "coding:16g=0s/30m,1h/45m,2h/30m,3h/1h; chat:25g=30m/20m,90m/30m,150m/45m; tool:5g=45m/10m,2h/15m",
-		      "ssd_free_gb" : 80
-		    },
-		    "cache_pressure" : {
-		      "description" : "Testing cache expiry with limited space",
-		      "pattern" : "big1:40g=0s/1h,2d/30m; big2:40g=1h/1h,3d/30m; big3:40g=2h/1h,4d/30m",
-		      "ssd_free_gb" : 60
-		    }
-		  }
-		}
-		EOT
+          // Planner budget for --maxctx (0 disables estimates unless overridden with --vram)
+          "planner_vram_gib" : 0,
+          "planner_margin_mib" : 768,
+          "planner_ctk" : "f16",
+          "planner_ctv" : "f16",
+
+          // Internal files
+          "stats_file" : "$config_dir/stats.json",
+          "pid_dir" : "/tmp/$progname",
+
+          // Global args passed to ALL models (customize these!)
+          "global_llama_args" : [
+            "--flash-attn",
+            "-ngl", "80",
+            "-c", "15000",
+            "--jinja"
+          ],
+
+          // Simulation presets (see --help for pattern format)
+          "simulations" : {
+            "simple" : {
+              "description" : "Basic cache trigger test - 2 uses within 24h",
+              "pattern" : "testmodel:10g=0s/5m,1h/5m,25h/5m",
+              "ssd_free_gb" : 50
+            },
+            "daily_work" : {
+              "description" : "Realistic daily workflow with model switching",
+              "pattern" : "llama:45g=0s/2h,1d/3h,2d/2h,3d/4h; qwen:30g=0s/30m,12h/1h,1d/30m,2d/1h; gemma:8g=2d/15m,3d/20m",
+              "ssd_free_gb" : 100
+            },
+            "rapid_switch" : {
+              "description" : "Frequent switching between models",
+              "pattern" : "coding:16g=0s/30m,1h/45m,2h/30m,3h/1h; chat:25g=30m/20m,90m/30m,150m/45m; tool:5g=45m/10m,2h/15m",
+              "ssd_free_gb" : 80
+            },
+            "cache_pressure" : {
+              "description" : "Testing cache expiry with limited space",
+              "pattern" : "big1:40g=0s/1h,2d/30m; big2:40g=1h/1h,3d/30m; big3:40g=2h/1h,4d/30m",
+              "ssd_free_gb" : 60
+            }
+          }
+        }
+        EOT
 
     $commented =~ s/\$HOME/$ENV{HOME}/g;
     $commented =~ s/\$config_dir/$config_dir/g;
@@ -714,24 +780,41 @@ sub load_stats {
     open my $fh, '<', $file or return {};
     my $json = do { local $/; <$fh> };
     close $fh;
-    if ($json !~ /\S/) {
-    	return {}
-	} else {
-		return decode_json($json);
-	}
+    return {} if $json !~ /\S/;
+
+    return eval { decode_json($json) } // {};
+}
+
+sub atomic_json_write {
+    my ($path, $data) = @_;
+
+    my $dir = dirname($path);
+    make_path($dir) unless -d $dir;
+
+    my $tmp = "$path.tmp";
+    my $lock = "$path.lock";
+
+    open my $lfh, '>>', $lock or die "Can't open lock file $lock: $!";
+    flock($lfh, LOCK_EX) or die "Can't lock $lock: $!";
+
+    open my $fh, '>', $tmp or die "Can't write temp file $tmp: $!";
+    print $fh JSON::XS->new->pretty->canonical->encode($data);
+    close $fh or die "Can't close temp file $tmp: $!";
+
+    rename $tmp, $path or die "Can't replace $path with $tmp: $!";
+    close $lfh;
 }
 
 sub write_stats {
     my $config = load_config();
 
-    # Write the GLOBAL $stats that's been modified in memory
-    open my $fh, '>', $config->{stats_file} or do {
-        serr(0, "Can't write stats: $!");
+    eval {
+        atomic_json_write($config->{stats_file}, $stats // {});
+        1;
+    } or do {
+        serr(0, "Can't write stats: $@");
         return;
     };
-
-    print $fh JSON::XS->new->pretty->encode($stats);
-    close $fh;
 
     $stats_dirty = 0;
 }
@@ -745,8 +828,177 @@ sub save_config {
     close $fh;
 }
 
+sub metadata_cache_valid {
+    my ($entry, $path, $cache_test) = @_;
+    return 0 unless $entry && $entry->{gguf};
+    return 0 unless $path && -f $path;
+
+    my @tests = split /\s*,\s*/, ($cache_test // 'size');
+    my @st = stat($path);
+    return 0 unless @st;
+
+    for my $test (@tests) {
+        if ($test eq 'size') {
+            return 0 unless defined $entry->{gguf}{source_size_bytes};
+            return 0 unless $entry->{gguf}{source_size_bytes} == ($st[7] // -1);
+        } elsif ($test eq 'time' || $test eq 'mtime') {
+            return 0 unless defined $entry->{gguf}{source_mtime};
+            return 0 unless $entry->{gguf}{source_mtime} == ($st[9] // -1);
+        }
+    }
+
+    return 1;
+}
+
+sub kv_type_bytes {
+    my $type = lc(shift // 'f16');
+    return 4 if $type eq 'f32';
+    return 2 if $type eq 'f16' || $type eq 'bf16';
+    return 1 if $type eq 'q8_0';
+    return 0.625 if $type eq 'q5_0' || $type eq 'q5_1';
+    return 0.5625 if $type eq 'q4_1';
+    return 0.5 if $type eq 'q4_0' || $type eq 'iq4_nl';
+    return 2;
+}
+
+sub format_params_b {
+    my $params_b = shift;
+    return '' unless defined $params_b && $params_b > 0;
+    return sprintf('%.2fB', $params_b) if $params_b < 10;
+    return sprintf('%.1fB', $params_b) if $params_b < 100;
+    return sprintf('%.0fB', $params_b);
+}
+
+sub effective_vram_gib {
+    my ($config, $opts) = @_;
+    return $opts->{vram} if $opts && defined $opts->{vram} && $opts->{vram} ne '';
+    return $config->{planner_vram_gib} // 0;
+}
+
+sub estimate_max_context {
+    my ($entry, $config, $opts) = @_;
+    return undef unless $entry && $entry->{gguf};
+
+    my $vram_gib = effective_vram_gib($config, $opts);
+    return undef unless $vram_gib && $vram_gib > 0;
+
+    my $kv_per_token = $entry->{gguf}{kv_bytes_per_token};
+    return undef unless $kv_per_token && $kv_per_token > 0;
+
+    my $margin = ($config->{planner_margin_mib} // 768) * 1024 * 1024;
+    my $budget = ($vram_gib * 1024 * 1024 * 1024) - $margin;
+    my $weights = $entry->{size_bytes} // $entry->{gguf}{source_size_bytes} // 0;
+    my $remaining = $budget - $weights;
+    return 0 if $remaining <= 0;
+
+    return int($remaining / $kv_per_token);
+}
+
+sub probe_model_metadata {
+    my ($config, $model_path) = @_;
+    my $bin = $config->{bin_gguf_dump} // 'gguf_dump.py';
+
+    open my $ph, '-|', $bin, '--verbose', $model_path
+        or die "Can't run $bin on $model_path: $!";
+    my @lines = <$ph>;
+    close $ph or die "$bin failed for $model_path";
+
+    my %kv;
+    my $tensor_params = 0;
+
+    for my $line (@lines) {
+        chomp $line;
+        if ($line =~ /^\s*\d+:\s+[^|]+\|\s*\d+\s*\|\s+([^=]+?)\s*=\s*(.+)\s*$/) {
+            my ($key, $value) = ($1, $2);
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+            $value =~ s/^'(.*)'$/$1/;
+            $kv{$key} = $value;
+            if ($key =~ /^tokenizer\.ggml\.(tokens|token_type)$/ && $line =~ /\|\s*(\d+)\s*\|/) {
+                $kv{$key . '.count'} = $2 + 0;
+            }
+            next;
+        }
+
+        if ($line =~ /^\s*\d+:\s+\d+\s*\|\s*([^|]+?)\|\s*[^|]+\|\s*.+$/) {
+            my $dims = $1;
+            my @dims = grep { $_ ne '' } map { s/^\s+|\s+$//gr } split /,/, $dims;
+            my $n = 1;
+            $n *= ($_ + 0) for @dims;
+            $tensor_params += $n if $n > 0;
+        }
+    }
+
+    my $arch = $kv{'general.architecture'} // '';
+    my $ctx = $kv{"$arch.context_length"};
+    my $layers = $kv{"$arch.block_count"};
+    my $embed = $kv{"$arch.embedding_length"};
+    my $heads = $kv{"$arch.attention.head_count"};
+    my $heads_kv = $kv{"$arch.attention.head_count_kv"} // $heads;
+    my $ffn = $kv{"$arch.feed_forward_length"};
+    my $size_label = $kv{'general.size_label'};
+    my $file_type = $kv{'general.file_type'};
+    my $token_count = $kv{'tokenizer.ggml.tokens.count'} // $kv{'tokenizer.ggml.token_type.count'};
+
+    my $head_dim_k = $kv{"$arch.attention.key_length"};
+    my $head_dim_v = $kv{"$arch.attention.value_length"};
+    if ((!defined $head_dim_k || $head_dim_k eq '') && $embed && $heads) {
+        $head_dim_k = int($embed / $heads);
+    }
+    if ((!defined $head_dim_v || $head_dim_v eq '') && $embed && $heads) {
+        $head_dim_v = int($embed / $heads);
+    }
+
+    my $n_embd_k_gqa = $kv{"$arch.attention.key_length_total"};
+    my $n_embd_v_gqa = $kv{"$arch.attention.value_length_total"};
+    if ((!defined $n_embd_k_gqa || $n_embd_k_gqa eq '') && $heads_kv && $head_dim_k) {
+        $n_embd_k_gqa = $heads_kv * $head_dim_k;
+    }
+    if ((!defined $n_embd_v_gqa || $n_embd_v_gqa eq '') && $heads_kv && $head_dim_v) {
+        $n_embd_v_gqa = $heads_kv * $head_dim_v;
+    }
+
+    my $kv_bytes_per_token;
+    if ($layers && $n_embd_k_gqa && $n_embd_v_gqa) {
+        my $ctk = kv_type_bytes($config->{planner_ctk});
+        my $ctv = kv_type_bytes($config->{planner_ctv});
+        $kv_bytes_per_token = $layers * (($n_embd_k_gqa * $ctk) + ($n_embd_v_gqa * $ctv));
+    }
+
+    my @st = stat($model_path);
+    die "Can't stat $model_path: $!" unless @st;
+
+    return {
+        source_size_bytes => $st[7],
+        source_mtime => $st[9],
+        source_name => $kv{'general.name'},
+        arch => $arch,
+        size_label => $size_label,
+        file_type => $file_type,
+        quantization_version => $kv{'general.quantization_version'},
+        params => $tensor_params,
+        params_b => $tensor_params ? ($tensor_params / 1_000_000_000) : undef,
+        train_ctx => $ctx,
+        n_layer => $layers,
+        n_embd => $embed,
+        n_ff => $ffn,
+        n_head => $heads,
+        n_head_kv => $heads_kv,
+        n_vocab => $token_count,
+        n_embd_k_gqa => $n_embd_k_gqa,
+        n_embd_v_gqa => $n_embd_v_gqa,
+        kv_bytes_per_token => $kv_bytes_per_token,
+        tokenizer_model => $kv{'tokenizer.ggml.model'},
+        tokenizer_pre => $kv{'tokenizer.ggml.pre'},
+        url => $kv{'general.url'} // $kv{'general.source.url'},
+        dump_tool => $bin,
+        dump_timestamp => gmtime->datetime,
+    };
+}
+
 sub scan_models {
-    my $config = shift;
+    my ($config, $opts) = @_;
+    $opts //= {};
 
     # Load into global if not already loaded
     $stats //= load_stats($config);
@@ -782,14 +1034,55 @@ sub scan_models {
 
             $stats->{$key}{size_bytes} = -s $full_path;
             $stats->{$key}{mtime} = (stat($full_path))[9];
-
         }, $path);
     }
 
-    # Write updated stats
-    open my $fh, '>', $config->{stats_file} or die "Can't write stats ($$config{stats_file}): $!";
-    print $fh JSON::XS->new->pretty->encode($stats);
-    close $fh;
+    $stats_dirty = 1;
+    write_stats();
+
+    return unless $opts->{update_details};
+
+    my @targets;
+    if ($opts->{target_model}) {
+        my $info = find_model($config, $stats, $opts->{target_model});
+        die "Model '$opts->{target_model}' not found
+" unless $info;
+        @targets = ( basename($info->{path}) );
+    } else {
+        @targets = sort keys %$stats;
+    }
+
+    my $cache_test = $opts->{cache_test} // $config->{cache_test} // 'size';
+    my $total = scalar @targets;
+    my $done = 0;
+
+    for my $key (@targets) {
+        $done++;
+        my $entry = $stats->{$key} // next;
+        my $path = $entry->{path};
+        unless ($path && -f $path) {
+            say STDERR "[$done/$total] skipping $key (missing path)";
+            next;
+        }
+
+        if (!$opts->{overwrite} && metadata_cache_valid($entry, $path, $cache_test)) {
+            say STDERR "[$done/$total] cached $key" if $verbose;
+            next;
+        }
+
+        say STDERR "[$done/$total] probing $key";
+        my $meta = eval { probe_model_metadata($config, $path) };
+        if (!$meta) {
+            my $err = $@ || 'unknown error';
+            chomp $err;
+            say STDERR "  ${red}metadata probe failed${rst}: $err";
+            next;
+        }
+
+        $entry->{gguf} = $meta;
+        $stats_dirty = 1;
+        write_stats();
+    }
 }
 
 sub find_model {
@@ -1218,7 +1511,7 @@ sub update_current_runtime {
 }
 
 sub edit_config {
-	system($editor, $config_file);
+    system($editor, $config_file);
 }
 
 sub get_known_tags {
@@ -1504,36 +1797,102 @@ sub delete_model_note {
     }
 }
 
+sub rename_model_entry {
+    my ($config, $stats, $spec) = @_;
+
+    my ($old, $new) = split /,/, ($spec // ''), 2;
+    for ($old, $new) {
+        $_ //= '';
+        s/^\s+|\s+$//g;
+    }
+
+    die "Use --rename old.gguf,new.gguf
+" unless $old && $new;
+    die "New name must end with .gguf
+" unless $new =~ /\.gguf\z/i;
+
+    my $model_info = find_model($config, $stats, $old)
+        or die "Model '$old' not found
+";
+
+    my $old_key = basename($model_info->{path});
+    die "Target '$new' already exists in stats
+" if exists $stats->{$new};
+
+    my @moved;
+    for my $location (@{$model_info->{locations} // []}) {
+        my $base = $config->{"${location}_path"};
+        next unless $base && -d $base;
+
+        my $src = "$base/$old_key";
+        next unless -f $src;
+
+        my $dst = "$base/$new";
+        die "Target file already exists: $dst
+" if -e $dst;
+        rename $src, $dst or die "Rename failed: $src -> $dst: $!
+";
+        push @moved, [$location, $dst];
+    }
+
+    my $entry = delete $stats->{$old_key} // {};
+    $stats->{$new} = $entry;
+    $stats->{$new}{locations} = [ map { $_->[0] } @moved ] if @moved;
+
+    my ($ssd_dst) = map { $_->[1] } grep { $_->[0] eq 'ssd' } @moved;
+    my ($hdd_dst) = map { $_->[1] } grep { $_->[0] eq 'hdd' } @moved;
+    $stats->{$new}{path} = $ssd_dst // $hdd_dst // $stats->{$new}{path};
+    $stats->{$new}{size_bytes} = -s $stats->{$new}{path} if $stats->{$new}{path} && -f $stats->{$new}{path};
+    $stats->{$new}{mtime} = (stat($stats->{$new}{path}))[9] if $stats->{$new}{path} && -f $stats->{$new}{path};
+    if ($stats->{$new}{gguf}) {
+        $stats->{$new}{gguf}{source_size_bytes} = $stats->{$new}{size_bytes} if $stats->{$new}{size_bytes};
+        $stats->{$new}{gguf}{source_mtime} = $stats->{$new}{mtime} if $stats->{$new}{mtime};
+    }
+
+    $stats_dirty = 1;
+    write_stats();
+
+    say "${gre}Renamed:${rst} $old_key -> $new";
+}
+
 sub show_model_details {
     my ($config, $stats, $model_name) = @_;
 
     my $model_info = find_model($config, $stats, $model_name);
     unless ($model_info) {
-        serr(0, "Model '$model_name' not found.");
-        exit 1;
+        serr(0, "Error: Model '$model_name' not found.");
+        # QUESTIONABLE: This was an exit 1 before
+        return;
     }
 
     my $model_key = basename($model_info->{path});
-    my $mstats = $stats->{$model_key} || {};
+    # QUESTIONABLE: chatgpt removed fallback to {}
+    # my $mstats = $stats->{$model_key} || {};
+    my $mstats = $stats->{$model_key};
 
     say "${whi}${inv} Model Details $rst\n";
 
     say "${c_attn}Name:$rst $cya$model_key$rst";
     say "${c_attn}Path:$rst $$mstats{path}" if $mstats->{path};
-
-    if ($mstats->{size_bytes}) {
-        say "${c_attn}Size:$rst " . format_size($mstats->{size_bytes});
-    }
+    say "${c_attn}Size:$rst " . format_size($mstats->{size_bytes}) if $mstats->{size_bytes};
 
     my $locs = $model_info->{locations} || [];
-    if (@$locs) {
-        say "${c_attn}Locations:$rst " . join(', ', @$locs);
+    say "${c_attn}Locations:$rst " . join(', ', @$locs) if @$locs;
+
+    if (my $gguf = $mstats->{gguf}) {
+        say "${c_attn}Params:$rst " . format_params_b($gguf->{params_b}) if $gguf->{params_b};
+        say "${c_attn}Arch:$rst $$gguf{arch}" if $gguf->{arch};
+        say "${c_attn}Train Ctx:$rst $$gguf{train_ctx}" if $gguf->{train_ctx};
+        say "${c_attn}Quant:$rst file_type=$$gguf{file_type}" if defined $gguf->{file_type};
+        say "${c_attn}Tokenizer:$rst $$gguf{tokenizer_model} / $$gguf{tokenizer_pre}" if $gguf->{tokenizer_model} || $gguf->{tokenizer_pre};
+        say "${c_attn}Vocab:$rst $$gguf{n_vocab}" if $gguf->{n_vocab};
+        say "${c_attn}KV/Token:$rst " . format_size($gguf->{kv_bytes_per_token}) if $gguf->{kv_bytes_per_token};
+        my $maxctx = estimate_max_context($mstats, $config, {});
+        say "${c_attn}Max Ctx @ budget:$rst $maxctx" if defined $maxctx && effective_vram_gib($config, {}) > 0;
     }
 
     my $tags = $mstats->{tags} || [];
-    if (@$tags) {
-        say "${c_attn}Tags:$rst ${c_tag}" . join(', ', @$tags) . $rst;
-    }
+    say "${c_attn}Tags:$rst ${c_tag}" . join(', ', @$tags) . $rst if @$tags;
 
     if ($mstats->{mmproj}) {
         my $mmproj_path = find_mmproj($config, $mstats->{mmproj});
@@ -1554,10 +1913,6 @@ sub show_model_details {
 
     if ($mstats->{total_runtime_seconds}) {
         say "${c_attn}Total Runtime:$rst " . format_time($mstats->{total_runtime_seconds});
-    }
-
-    if ($mstats->{last_runtime_seconds}) {
-        say "${c_attn}Last Runtime:$rst " . format_time($mstats->{last_runtime_seconds});
     }
 
     # Calculate mtime range for ranking
@@ -1658,7 +2013,8 @@ sub list_mmproj {
 }
 
 sub list_models {
-    my $config = shift;
+    my ($config, $opts) = @_;
+    $opts //= {};
 
     # Get terminal width
     my $term_width = eval {
@@ -1684,6 +2040,8 @@ sub list_models {
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
 
+    my $show_maxctx = $opts->{maxctx} ? 1 : 0;
+
     # Determine if we need to wrap based on longest model name + stats width
     my $longest_model = 0;
     for my $model (@models) {
@@ -1691,61 +2049,52 @@ sub list_models {
         $longest_model = $len if $len > $longest_model;
     }
 
-    # Stats columns: Rank(6) + SSD(5) + HDD(5) + Last(12) + Uses(6) + Mtime(12) + Tags(20) + spacing = ~75
-    my $stats_width = 75;
+    # QUESTIONABLE: We had a different width handling for stats:
+    ## Stats columns: Rank(6) + SSD(5) + HDD(5) + Last(12) + Uses(6) + Mtime(12) + Tags(20) + spacing = ~75
+    #my $stats_width = 75;
+
+
+    my $stats_width = $show_maxctx ? 94 : 84;
     my $need_wrap = ($longest_model + $stats_width) > $term_width;
-    my $wrapped_indent = ' ';
+    my @wrapped_indent = ();
+
+    my @cols = (
+        { title => 'Rank', align => 'point', align_title => 'center' },
+        \"  ",
+        { title => 'ssd', align => 'left' },
+        \"  ",
+        { title => 'hdd', align => 'left' },
+        \"  ",
+        { title => 'Params', align => 'right', align_title => 'right' },
+        \"  ",
+        { title => 'Last', align => 'left' },
+        \"  ",
+        { title => 'Uses', align => 'right', align_title => 'right' },
+        \"  ",
+        { title => 'Mtime', align => 'left' },
+    );
+    push @cols, ("  ", { title => 'MaxCtx', align => 'right', align_title => 'right' }) if $show_maxctx;
+    push @cols, ("  ", { title => 'Tags', align => 'left' });
 
     my $tb;
-    if ($need_wrap) {
-        # Wrapped mode - no "Model" header, just indented stats columns
-        $tb = Text::Table->new(
-            $wrapped_indent,
-            { title => "Rank", align => 'point', align_title => 'center'  },
-            \"  ",
-            { title => "SSD", align => 'left' },
-            \"  ",
-            { title => "HDD", align => 'left' },
-            \"  ",
-            { title => "Last", align => 'left' },
-            \"  ",
-            { title => "Uses", align => 'right', align_title => 'right' },
-            \"  ",
-            { title => "Mtime", align => 'left' },
-            \"  ",
-            { title => "Tags", align => 'left' },
-        );
-    } else {
-        # Normal table with Model column
-        $tb = Text::Table->new(
-            { title => "Model", align => 'left' },
-            \"  ",
-            { title => "Rank", align => 'point', align_title => 'center'  },
-            \"  ",
-            { title => "ssd", align => 'left' },
-            \"  ",
-            { title => "hdd", align => 'left' },
-            \"  ",
-            { title => "Last", align => 'left' },
-            \"  ",
-            { title => "Uses", align => 'right', align_title => 'right' },
-            \"  ",
-            { title => "Mtime", align => 'left' },
-            \"  ",
-            { title => "Tags", align => 'left' },
-        );
+    @wrapped_indent = (' ') if $need_wrap;
+    $tb = Text::Table->new(@wrapped_indent, @cols);
     }
 
     my @ssd_only_models;
-
-    # Calculate available width for tags
-    my $tags_col_width = 20;  # Default truncate width for tags
+    my $tags_col_width = 18;
 
     for my $model (@models) {
         my $mstats = $stats_to_use->{$model};
         my $rank = sprintf("%.1f", rank_model($mstats, $newest_mtime, $oldest_mtime));
         my $uses = $mstats->{total_uses} // 0;
         my $last = $mstats->{last_used} ? substr($mstats->{last_used}, 0, 10) : 'never';
+        my $params_str = '';
+        if ($mstats->{gguf} && $mstats->{gguf}{params_b}) {
+            $params_str = format_params_b($mstats->{gguf}{params_b});
+        } elsif ($mstats->{gguf} && $mstats->{gguf}{size_label}) {
+            $params_str = $mstats->{gguf}{size_label};
+        }
 
         # Format mtime
         my $mtime_str = 'unknown';
@@ -1811,13 +2160,23 @@ sub list_models {
             $tags_str = "${c_tag}$tags_display$rst";
         }
 
+        my $maxctx_str = '';
+        if ($show_maxctx) {
+            my $ctx = estimate_max_context($mstats, $config, $opts);
+            $maxctx_str = defined $ctx ? $ctx : '-';
+        }
+
+        my @row = ($rank, $ssd_str, $hdd_str, $params_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+        push @row, $maxctx_str if $show_maxctx;
+        push @row, $tags_str;
+
         if ($need_wrap) {
             # Model name on its own line, then stats on next line with indent
             say "$cya$model$rst";
-            $tb->add('', $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}", $tags_str);
+            $tb->add('', @row);
         } else {
             # Normal single-line display
-            $tb->add("$cya$model$rst", $rank, $ssd_str, $hdd_str, $last, $uses, "${rst}${cya}$mtime_str${rst}", $tags_str);
+            $tb->add("$cya$model$rst", @row);
         }
     }
 
@@ -1864,8 +2223,7 @@ sub list_models {
         my $item_plain = $item;
         $item_plain =~ s/\e\[[0-9;]+m//g;
         my $item_len = length($item_plain);
-
-        my $separator = $first_item ? "" : ", ";
+        my $separator = $first_item ? '' : ', ';
         my $sep_len = length($separator);
 
         if ($current_len > 0 && ($current_len + $sep_len + $item_len) > $term_width) {
@@ -1881,6 +2239,10 @@ sub list_models {
     }
 
     say $key_line . $rst;
+
+    if ($show_maxctx && !(effective_vram_gib($config, $opts) > 0)) {
+        say "${gra}MaxCtx disabled until planner_vram_gib is set in config or --vram is provided.$rst";
+    }
 
     # Warn about SSD-only models
     if (@ssd_only_models) {
