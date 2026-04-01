@@ -2104,6 +2104,11 @@ sub list_models {
         \"  ",
         { title => 'Mtime', align => 'left' },
     );
+    unshift @cols,
+		(
+			{ title => "Model", align => 'left' },
+			\"  ",
+		) if !$need_wrap;
     push @cols, ("  ", { title => 'MaxCtx', align => 'right', align_title => 'right' }) if $show_maxctx;
     push @cols, ("  ", { title => 'Tags', align => 'left' });
 
