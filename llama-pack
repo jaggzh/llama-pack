@@ -25,6 +25,7 @@ my $def_port = 8080;
 my $def_host = '127.0.0.1';
 my $config_dir = $ENV{HOME} . "/.config/$progname";
 my $config_file = "$config_dir/config.json";
+my $stats_file = "$config_dir/stats.json";
 my $editor = $ENV{EDITOR} // 'vim';
 
 # ANSI color exports
@@ -635,7 +636,7 @@ sub load_config {
 
         my $config = decode_json($json);
         $config->{stats_file} = glob($config->{stats_file}) if ($config->{stats_file} // 0);
-        $config->{stats_file} //= "$config_dir/stats.json";
+        $config->{stats_file} //= $stats_file;
         $config->{hdd_path} = glob($config->{hdd_path}) if ($config->{hdd_path} // 0);
         $config->{ssd_path} = glob($config->{ssd_path}) if ($config->{ssd_path} // 0);
         $config->{pid_dir} = glob($config->{pid_dir}) if ($config->{pid_dir} // 0);
@@ -660,7 +661,7 @@ sub load_config {
         bin_gguf_dump => 'gguf_dump.py',
         default_port => $def_port,
         default_host => $def_host,
-        stats_file => "$config_dir/stats.json",
+        stats_file => "$stats_file",
         pid_dir => "/tmp/$progname",
         cache_test => 'size',
         planner_vram_gib => 0,
@@ -750,7 +751,7 @@ sub load_config {
           "planner_ctv" : "f16",
 
           // Internal files
-          "stats_file" : "$config_dir/stats.json",
+          "stats_file" : "$stats_file",
           "pid_dir" : "/tmp/$progname",
 
           // Global args passed to ALL models (customize these!)
@@ -1541,7 +1542,7 @@ sub update_current_runtime {
 }
 
 sub edit_config {
-    system($editor, $config_file);
+    system($editor, $config_file, $stats_file);
 }
 
 sub get_known_tags {
