@@ -395,8 +395,17 @@ sub main {
     start_server($config, $opts, $model_info, \@final_llama_args);
 }
 
+
+
+sub pager { # $p = pager(); print $p "stuff"; pagerdone($p);
+    my $pager;
+    open($pager, '|-', ($ENV{PAGER} // 'less -RF')) && return $pager;
+    \*STDOUT;
+}
+
 sub usage {
-    print <<~EOT;
+    my $p = pager();
+    print $p <<~EOT;
         $progname: Manage and load LLM models with smart SSD caching.
 
         RUNNING MODELS:
@@ -409,6 +418,7 @@ sub usage {
 
         MANAGING MODELS:
           -l, --list           List all models with stats and rankings
+
           -u, --update         Scan directories and update model index
           --uu                 Scan/update and refresh GGUF metadata for all models
           --overwrite          With --uu, ignore cached metadata and refresh anyway
@@ -418,6 +428,7 @@ sub usage {
           --rename OLD,NEW     Rename a model on disk and in stats.json
           --status, --stat     Show currently running servers
           --st
+          --re, -r             Regex to search models list (not implemented)
 
         TAGS (model-specific):
           -t, --tag TAGS       Add/remove tags (e.g., -t au,img or -t au,-abl)
@@ -491,6 +502,7 @@ sub usage {
 
         CONFIG: $config_file
         EOT
+	pagerdone($p);
 }
 
 sub parse_args {
@@ -1044,7 +1056,7 @@ sub scan_models {
         next unless -d $path;
 
         find(sub {
-            return unless -f && /\.gguf$/i;
+            return if !-f || !/\.gguf$/i;
             # Skip mmproj files - they're not models
             return if /mmproj/i;
             my $full_path = $File::Find::name;
