@@ -43,7 +43,7 @@ our $current_runtime_start;
 our $stats;  # Global stats hash - loaded once, modified in memory, written on exit
 
 use v5.36; # nice
-sub se; sub sel; sub pe; sub pel; sub serr; sub swarn; # Keep for use w/o ()
+sub se; sub sel; sub pe; sub pel; sub serrl; sub swarnl; # Keep for use w/o ()
 sub pe { print STDERR @_; }
 sub pel { my $l=shift; print STDERR @_ if $verbose >= $l; }
 sub se { say STDERR @_; }
@@ -79,12 +79,9 @@ sub main {
         exit 0;
     }
 
-    # Add host/port to llama_args if they weren't already added
-    my $has_port = grep { $_ eq '--port' } @$llama_args;
-    my $has_host = grep { $_ eq '--host' } @$llama_args;
-
-    push @$llama_args, '--port', $opts->{port} unless $has_port;
-    push @$llama_args, '--host', $opts->{host} unless $has_host;
+    # NOTE: port/host are NOT added to llama_args here; they are injected
+    # unconditionally at serve time (after stored-args selection) so they
+    # are never accidentally saved into per-model stored args.
 
     # Handle commands that don't need model loading
     if ($opts->{list}) {
@@ -177,7 +174,7 @@ sub main {
     if ($target_model && $opts->{tags}) {
         my $model_info = find_model($config, $stats, $target_model);
         if (!$model_info) {
-            serr(0, "Model '$target_model' not found.");
+            serrl(0, "Model '$target_model' not found.");
             exit 1;
         }
         my $model_key = basename($model_info->{path});
@@ -203,7 +200,7 @@ sub main {
     if ($target_model && ($opts->{note_edit} || $opts->{note_str} || $opts->{note_del})) {
         my $model_info = find_model($config, $stats, $target_model);
         if (!$model_info) {
-            serr(0, "Model '$target_model' not found.");
+            serrl(0, "Model '$target_model' not found.");
             exit 1;
         }
         my $model_key = basename($model_info->{path});
@@ -256,7 +253,7 @@ sub main {
 
     # Need a model to proceed with loading
     unless ($opts->{model}) {
-        serr(0, "No model specified. Use -m or --model");
+        serrl(0, "No model specified. Use -m or --model");
         exit 1;
     }
 
@@ -268,7 +265,7 @@ sub main {
     }
 
     # Load stats ONCE into global
-    swarn 0, "Removed load_stats() from the every-run approach. Need to make sure that was okay.";
+    swarnl 0, "Removed load_stats() from the every-run approach. Need to make sure that was okay.";
     # We might need to uncomment this, but it's likely claude made this properly only load
     # stats in paths that need it.
     # $stats = load_stats($config);
@@ -276,7 +273,7 @@ sub main {
     # Find the model (future: check nicknames first)
     my $model_info = find_model($config, $stats, $opts->{model});
     unless ($model_info) {
-        serr(0, "Model '$$opts{model}' not found.");
+        serrl(0, "Model '$$opts{model}' not found.");
         exit 1;
     }
 
@@ -288,7 +285,28 @@ sub main {
     my $mstats = $stats->{$model_key};
 
 	# --maxctx calculation request
-    if ($opts->{maxctx}) {
+    # Apply stored per-model settings if not overridden at runtime
+    if (!$opts->{vram_explicit} && defined $mstats->{stored_vram}) {
+        $opts->{vram} = $mstats->{stored_vram};
+        sel 1, "${gre}Using stored vram budget for this model: $$opts{vram}GiB$rst";
+    }
+    # Determine effective port/host: runtime explicit > stored per-model > config default
+    $opts->{port} = $opts->{port_explicit} ? $opts->{port}
+                  : ($mstats->{stored_port} // $opts->{port});
+    $opts->{host} = $opts->{host_explicit} ? $opts->{host}
+                  : ($mstats->{stored_host} // $opts->{host});
+
+    if ($opts->{calc_maxctx}) {
+        my $vram = effective_vram_gib($config, $opts);
+        unless ($vram && $vram > 0) {
+            say STDERR "${c_err}--calc-maxctx requires a VRAM budget.$rst";
+            say STDERR "Either provide --vram 23.5 on the command line,";
+            say STDERR "run 'lpp -m MODEL --vram 23.5 --store' to save it for this model, or";
+            say STDERR "set 'planner_vram_gib' in config.json for a global default.";
+            say STDERR "${gra}(Run with --ec to edit config)$rst";
+            exit 1;
+        }
+
        # Optional: probe on demand if metadata is missing
         if (!$mstats->{gguf}) {
             say "${yel}No cached GGUF metadata for $model_key; probing now...$rst" if $verbose;
@@ -302,7 +320,6 @@ sub main {
         my $ctx = estimate_max_context($mstats, $config, $opts);
         my $params = format_params_b($mstats->{gguf}{params_b});
         my $train_ctx = $mstats->{gguf}{train_ctx} // '-';
-        my $vram = effective_vram_gib($config, $opts);
 
         say "${c_attn}Model:$rst $model_key";
         say "${c_attn}Params:$rst " . ($params || '-');
@@ -318,21 +335,50 @@ sub main {
     # Determine which args to use
     my @final_llama_args;
     if (@$llama_args && (!$mstats->{llama_args} || $opts->{store})) {
-        # First run with args, or explicit --store: save them
-        $mstats->{llama_args} = $llama_args;
-        @final_llama_args = @$llama_args;
+        # First run with args, or explicit --store: strip port/host then save
+        my @args_to_store = _strip_port_host(@$llama_args);
+        $mstats->{llama_args} = \@args_to_store;
+        @final_llama_args = @args_to_store;
         $stats_dirty = 1;
         say "${gre}Stored model-specific args.$rst" if $verbose;
     } elsif ($mstats->{llama_args}) {
-        # Use stored args
+        # Use stored args (already stripped of port/host when saved)
         @final_llama_args = @{$mstats->{llama_args}};
         say "${gre}Using stored model-specific args.$rst" if $verbose;
         if (@$llama_args && !$opts->{store}) {
             say "${yel}Note: New args provided but not stored. Use --store to update.$rst";
         }
     } else {
-        # No stored args, use what was provided (if any)
-        @final_llama_args = @$llama_args;
+        # No stored args, use what was provided (if any), stripped of port/host
+        @final_llama_args = _strip_port_host(@$llama_args);
+    }
+
+    # Always inject current effective port/host — never rely on stored values in llama_args
+    push @final_llama_args, '--port', $opts->{port};
+    push @final_llama_args, '--host', $opts->{host};
+
+    # Store per-model runtime settings when --store is used (independent of llama_args)
+    if ($opts->{store}) {
+        if ($opts->{port_explicit}) {
+            $mstats->{stored_port} = $opts->{port};
+            $stats_dirty = 1;
+            say "${gre}Stored port $$opts{port} for this model.$rst" if $verbose;
+        }
+        if ($opts->{host_explicit}) {
+            $mstats->{stored_host} = $opts->{host};
+            $stats_dirty = 1;
+            say "${gre}Stored host $$opts{host} for this model.$rst" if $verbose;
+        }
+        if ($opts->{vram_explicit}) {
+            $mstats->{stored_vram} = $opts->{vram};
+            $stats_dirty = 1;
+            say "${gre}Stored vram budget $$opts{vram}GiB for this model.$rst" if $verbose;
+        }
+        if (!$opts->{no_cuda} && defined $opts->{cuda_devices}) {
+            $mstats->{cuda_visible_devices} = $opts->{cuda_devices};
+            $stats_dirty = 1;
+            say "${gre}Stored CUDA_VISIBLE_DEVICES='$$opts{cuda_devices}' for this model.$rst" if $verbose;
+        }
     }
 
     # Prepend global args from config
@@ -391,8 +437,14 @@ sub main {
         fork_ssd_copy($config, $model_info, $stats);
     }
 
+    # Determine CUDA_VISIBLE_DEVICES for this run:
+    #   --no-cuda suppresses it; --cuda DEVS overrides; else use stored value
+    my $cuda_for_run = $opts->{no_cuda}         ? undef
+                     : defined $opts->{cuda_devices} ? $opts->{cuda_devices}
+                     :                             $mstats->{cuda_visible_devices};
+
     # Start llama-server
-    start_server($config, $opts, $model_info, \@final_llama_args);
+    start_server($config, $opts, $model_info, \@final_llama_args, $cuda_for_run);
 }
 
 
@@ -415,6 +467,12 @@ sub usage {
           -p, --port N         Server port (default: $def_port)
           --host ADDR          Server host (default: $def_host, use 0.0.0.0 for all interfaces)
           --store, --keep      Save model-specific args for future runs
+                               Also persists -p, --host, --vram, --cuda when provided
+
+        CUDA DEVICE SELECTION (per-model):
+          --cuda DEVS          Set CUDA_VISIBLE_DEVICES for this run (e.g. --cuda 0)
+                               Use --cuda 0 --store to remember it for this model
+          --no-cuda            Suppress any stored CUDA_VISIBLE_DEVICES for this run
 
         MANAGING MODELS:
           -l, --list           List all models with stats and rankings
@@ -423,7 +481,9 @@ sub usage {
           --uu                 Scan/update and refresh GGUF metadata for all models
           --overwrite          With --uu, ignore cached metadata and refresh anyway
           --cache-test SPEC    Metadata invalidation test: size or size,time
-          --maxctx             In -l, show estimated max context for current VRAM budget
+          --maxctx N           Pass -c N to llama-server (context window size)
+          --calc-maxctx        With -m, show max context estimate (requires --vram or stored/config vram)
+                               With -l, show MaxCtx column in model list
           --vram N             Override planner VRAM budget in GiB (e.g. 23 or 23.5)
           --rename OLD,NEW     Rename a model on disk and in stats.json
           --status, --stat     Show currently running servers
@@ -516,8 +576,13 @@ sub parse_args {
         update_details => 0,
         overwrite => 0,
         cache_test => undef,
-        maxctx => 0,
+        calc_maxctx => 0,
         vram => undef,
+        vram_explicit => 0,
+        port_explicit => 0,
+        host_explicit => 0,
+        cuda_devices => undef,  # CUDA_VISIBLE_DEVICES to set for this model
+        no_cuda => 0,           # suppress stored cuda for this run
         rename => undef,
         kill => 0,
         kill_all => 0,
@@ -572,10 +637,20 @@ sub parse_args {
             $opts{overwrite} = 1;
         } elsif ($arg eq '--cache-test') {
             $opts{cache_test} = shift @ARGV;
+        } elsif ($arg eq '--calc-maxctx') {
+            $opts{calc_maxctx} = 1;
         } elsif ($arg eq '--maxctx') {
-            $opts{maxctx} = 1;
+            if (@ARGV && $ARGV[0] =~ /^\d+$/) {
+                # --maxctx N: context size shorthand, passes -c N to llama-server
+                push @llama_args, '-c', shift @ARGV;
+            } else {
+                # bare --maxctx: backward-compat alias for --calc-maxctx
+                say STDERR "${c_warn}Note: bare --maxctx is now --calc-maxctx. Use --maxctx N to set context size.$rst";
+                $opts{calc_maxctx} = 1;
+            }
         } elsif ($arg eq '--vram') {
             $opts{vram} = shift @ARGV;
+            $opts{vram_explicit} = 1;
         } elsif ($arg eq '--rename' || $arg eq '--ren' || $arg eq '--mv') {
             $opts{rename} = shift @ARGV;
         } elsif ($arg eq '-k' || $arg eq '--kill') {
@@ -616,11 +691,15 @@ sub parse_args {
         } elsif ($arg eq '--sim-ssd-free') {
             $opts{sim_ssd_free} = shift @ARGV;
         } elsif ($arg eq '--host') {
-            my $host = shift @ARGV;
-            $opts{host} = $host;
+            $opts{host} = shift @ARGV;
+            $opts{host_explicit} = 1;
         } elsif ($arg eq '-p' || $arg eq '--port') {
-            my $port = shift @ARGV;
-            $opts{port} = $port;
+            $opts{port} = shift @ARGV;
+            $opts{port_explicit} = 1;
+        } elsif ($arg eq '--cuda') {
+            $opts{cuda_devices} = shift @ARGV;  # e.g. "0", "0,1", ""
+        } elsif ($arg eq '--no-cuda') {
+            $opts{no_cuda} = 1;
         } elsif ($arg eq '--store' || $arg eq '--keep') {
             $opts{store} = 1;
         } elsif ($arg eq '--ce' || $arg eq '--ec' || $arg eq '--edit-config') {
@@ -853,7 +932,7 @@ sub write_stats {
         atomic_json_write($config->{stats_file}, $stats // {});
         1;
     } or do {
-        serr(0, "Can't write stats: $@");
+        serrl(0, "Can't write stats: $@");
         return;
     };
 
@@ -1070,14 +1149,43 @@ sub scan_models {
             push @{$stats->{$key}{locations}}, $location
                 unless grep { $_ eq $location } @{$stats->{$key}{locations}};
 
-            # Update path to prefer SSD
-            if ($location eq 'ssd' || !$stats->{$key}{path}) {
+            # Update path: always prefer SSD; for HDD, update if no path set
+            # OR if the currently stored path no longer exists (file relocated).
+            if ($location eq 'ssd'
+                    || ($stats->{$key}{path} // 1)
+                    || !-f $stats->{$key}{path}) {
                 $stats->{$key}{path} = $full_path;
             }
 
             $stats->{$key}{size_bytes} = -s $full_path;
             $stats->{$key}{mtime} = (stat($full_path))[9];
         }, $path);
+    }
+
+    # Post-scan: detect stats entries that weren't found anywhere.
+    # These are either deleted files or files moved outside scanned dirs.
+    my @missing_keys;
+    for my $key (keys %$stats) {
+        my $locs = $stats->{$key}{locations} // [];
+        next if @$locs;  # found during this scan
+
+        my $stored_path = $stats->{$key}{path} // '';
+        if ($stored_path && -f $stored_path) {
+            # File still exists at its stored path but wasn't picked up by
+            # scan (e.g. it's outside the configured ssd/hdd dirs).
+            # Leave it alone but note it.
+            swarnl 0, "Warning: '$key' found at stored path but outside scan dirs: $stored_path";
+        } else {
+            push @missing_keys, $key;
+        }
+    }
+
+    if (@missing_keys) {
+        swarnl 0, "Warning: " . scalar(@missing_keys) . " model(s) not found during scan (deleted or moved outside configured directories):";
+        for my $key (sort @missing_keys) {
+            my $old_path = $stats->{$key}{path} // '(no path)';
+            swarnl 0, "  $key${rst} — was: $old_path";
+        }
     }
 
     $stats_dirty = 1;
@@ -1307,7 +1415,7 @@ sub fork_ssd_copy {
         say "${blu}[Background] Copying to SSD: $src -> $dst$rst" if $verbose;
 
         copy($src, $dst) or do {
-            serr(0, "[Background] Copy failed: $!");
+            serrl(0, "[Background] Copy failed: $!");
             exit 1;
         };
 
@@ -1326,12 +1434,32 @@ sub fork_ssd_copy {
     }
 }
 
+sub _strip_port_host {
+    # Remove --port VAL and --host VAL pairs from an arg list.
+    # Port and host are runtime options; they must never be stored
+    # in per-model args or they'll be replayed on the wrong port later.
+    my @in = @_;
+    my @out;
+    while (@in) {
+        my $a = shift @in;
+        if ($a eq '--port' || $a eq '--host') {
+            shift @in;  # discard the value too
+        } else {
+            push @out, $a;
+        }
+    }
+    return @out;
+}
+
 sub start_server {
-    my ($config, $opts, $model_info, $llama_args) = @_;
+    my ($config, $opts, $model_info, $llama_args, $cuda_devices) = @_;
 
     my $binary = $config->{server_binary};
     my @cmd = ($binary, '-m', $model_info->{path}, @$llama_args);
 
+    if (defined $cuda_devices) {
+        se "${gre}CUDA_VISIBLE_DEVICES=$cuda_devices$rst";
+    }
     se "${gre}Starting: $rst" . join(' ', @cmd);
 
     # Write PID file BEFORE forking so we have the file reference
@@ -1342,7 +1470,8 @@ sub start_server {
     die "Fork failed: $!" unless defined $pid;
 
     if ($pid == 0) {
-        # Child - exec server
+        # Child - set CUDA device if specified, then exec server
+        $ENV{CUDA_VISIBLE_DEVICES} = $cuda_devices if defined $cuda_devices;
         exec(@cmd) or die "Exec failed: $!";
     }
 
@@ -1471,12 +1600,11 @@ sub kill_instances {
             kill_pid($running->{pid});
             unlink $full;
             $killed_count++;
+            last unless $opts->{kill_all};  # stop after first confirmed kill (single-port mode)
         } else {
             say "${gra}Removing stale PID file: $file (process $$running{pid} not running)$rst" if $verbose;
             unlink $full;
         }
-
-        last unless $opts->{kill_all};
     }
 
     if ($killed_count == 0) {
@@ -1903,7 +2031,7 @@ sub show_model_details {
 
     my $model_info = find_model($config, $stats, $model_name);
     unless ($model_info) {
-        serr(0, "Error: Model '$model_name' not found.");
+        serrl(0, "Error: Model '$model_name' not found.");
         # QUESTIONABLE: This was an exit 1 before
         return;
     }
@@ -1985,23 +2113,41 @@ sub show_model_details {
 sub find_mmproj {
     my ($config, $mmproj_name) = @_;
 
-    # Try SSD first, then HDD
+    # mmproj_name may be a basename or a full path.
+    # If it's a full path that still exists, use it directly.
+    if ($mmproj_name =~ m{/} && -f $mmproj_name) {
+        return $mmproj_name;
+    }
+
+    my $base = basename($mmproj_name);
+
+    # Search recursively through all scan directories (same as model scan).
+    # opendir/readdir was only searching the root level; mmproj files can live
+    # in subdirectories alongside their models.
+    my $found;
     for my $location (qw(ssd hdd)) {
-        my $path = $config->{"${location}_path"};
-        next unless -d $path;
+        my $root = $config->{"${location}_path"};
+        next unless -d $root;
 
-        # Try exact filename match
-        my $full_path = "$path/$mmproj_name";
-        return $full_path if -f $full_path;
-
-        # Try pattern match
-        opendir my $dh, $path or next;
-        my @matches = grep { /\Q$mmproj_name\E/i && /mmproj/i && /\.gguf$/i } readdir($dh);
-        closedir $dh;
-
-        if (@matches) {
-            return "$path/$matches[0]";
+        # Fast path: exact match at root level
+        if (-f "$root/$base") {
+            return "$root/$base";
         }
+
+        # Recursive search
+        File::Find::find(sub {
+            return if $found;
+            return unless -f && /\.gguf$/i && /mmproj/i;
+            if (basename($File::Find::name) eq $base) {
+                $found = $File::Find::name;
+            }
+            # Fallback: fuzzy name match (pattern contains our stored name)
+            elsif ($File::Find::name =~ /\Q$base\E/i) {
+                $found //= $File::Find::name;
+            }
+        }, $root);
+
+        return $found if $found;
     }
 
     return undef;
@@ -2083,7 +2229,7 @@ sub list_models {
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
 
-    my $show_maxctx = $opts->{maxctx} ? 1 : 0;
+    my $show_maxctx = $opts->{calc_maxctx} ? 1 : 0;
 
     # Determine if we need to wrap based on longest model name + stats width
     my $longest_model = 0;
@@ -2675,13 +2821,13 @@ sub format_time {
 # UTILITY FUNCTIONS
 # ============================================================================
 
-sub serr {
+sub serrl {
     my ($level, @msg) = @_;
     return if $verbose < $level;
     say STDERR a24bg(100, 0, 0) . $whi, @msg, $rst;
 }
 
-sub swarn {
+sub swarnl {
     my ($level, @msg) = @_;
     return if $verbose < $level;
     say STDERR $rst, a24bg(255, 255, 90) . $bla, @msg, $rst;
