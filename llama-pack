@@ -34,6 +34,7 @@ our ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra);
 our ($bbla, $bred, $bgre, $yel, $bblu, $bmag, $bcya, $whi);
 our ($rst, $inv, $cll, $cllr, $cls, $clsb, $ahome);
 our ($c_warn, $c_err, $c_attn, $c_attn_ctx, $c_sel, $c_tag);
+our ($c_mm_unused, $c_mm_used, $c_notice, $c_emph);
 
 init_colors();
 
@@ -166,15 +167,16 @@ sub main {
     if ($opts->{manage_model} && !$opts->{model} &&
         !$opts->{tags} && !$opts->{note_edit} && !$opts->{note_str} && !$opts->{note_del} &&
         !$opts->{mmproj} && !$opts->{rm_mmproj}) {
-        show_model_details($config, $stats, $opts->{manage_model});
+        show_model_details($config, $stats, $opts->{manage_model}, $opts);
         exit 0;
     }
 
     # Handle tag operations on specific model
     if ($target_model && $opts->{tags}) {
-        my $model_info = find_model($config, $stats, $target_model);
+        my $model_info = find_model($config, $stats, $target_model,
+            { force => $opts->{force}, num => $opts->{num} });
         if (!$model_info) {
-            serrl(0, "Model '$target_model' not found.");
+            # find_model already printed the disambiguation message if needed
             exit 1;
         }
         my $model_key = basename($model_info->{path});
@@ -198,7 +200,8 @@ sub main {
 
     # Handle note operations on specific model
     if ($target_model && ($opts->{note_edit} || $opts->{note_str} || $opts->{note_del})) {
-        my $model_info = find_model($config, $stats, $target_model);
+        my $model_info = find_model($config, $stats, $target_model,
+            { force => $opts->{force}, num => $opts->{num} });
         if (!$model_info) {
             serrl(0, "Model '$target_model' not found.");
             exit 1;
@@ -222,7 +225,8 @@ sub main {
     # Handle mmproj operations on specific model
     if ($target_model && ($opts->{mmproj} || $opts->{rm_mmproj})) {
         say "${gre}DEBUG: Handling mmproj for $target_model$rst" if $verbose >= 2;
-        my $model_info = find_model($config, $stats, $target_model);
+        my $model_info = find_model($config, $stats, $target_model,
+            { force => $opts->{force}, num => $opts->{num} });
         if (!$model_info) {
             say STDERR "Error: Model '$target_model' not found.";
             exit 1;
@@ -271,7 +275,8 @@ sub main {
     # $stats = load_stats($config);
 
     # Find the model (future: check nicknames first)
-    my $model_info = find_model($config, $stats, $opts->{model});
+    my $model_info = find_model($config, $stats, $opts->{model},
+        { force => $opts->{force}, num => $opts->{num} });
     unless ($model_info) {
         serrl(0, "Model '$$opts{model}' not found.");
         exit 1;
@@ -626,6 +631,8 @@ sub parse_args {
         no_mmproj => 0,
         rm_mmproj => 0,
         list_mmproj => 0,
+        force => 0,
+        num   => undef,   # -n N: pick match #N from a multi-match numbered list
     );
     my @llama_args;
     my $in_llama_args = 0;
@@ -710,6 +717,10 @@ sub parse_args {
             $opts{rm_mmproj} = 1;
         } elsif ($arg eq '--list-mmproj' || $arg eq '--lmm') {
             $opts{list_mmproj} = 1;
+        } elsif ($arg eq '-f' || $arg eq '--force') {
+            $opts{force} = 1;
+        } elsif ($arg eq '-n' || $arg eq '--num') {
+            $opts{num} = shift @ARGV;
         } elsif ($arg eq '--simulate') {
             $opts{simulate} = shift @ARGV;
         } elsif ($arg eq '--sim-ssd-free') {
@@ -1260,13 +1271,45 @@ sub scan_models {
     }
 }
 
-sub find_model {
-    my ($config, $stats, $model_name) = @_;
+sub _resolve_match {
+    # Given a key that's been selected, check SSD presence, update stats if stale,
+    # and return the { path, location, locations } hashref callers expect.
+    my ($config, $stats, $key) = @_;
+    my $locs = $stats->{$key}{locations} // [];
+    my $ssd_path = $config->{ssd_path} . '/' . $key;
+    my $has_ssd_file = -f $ssd_path;
+    my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
+    if ($has_ssd_file && !$has_ssd_stat) {
+        push @$locs, 'ssd';
+        $stats->{$key}{locations} = $locs;
+        $stats->{$key}{path}      = $ssd_path;
+        $stats_dirty = 1;
+    }
+    my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
+    my $path      = $has_ssd_file ? $ssd_path : $stats->{$key}{path};
+    return { path => $path, location => $preferred, locations => $locs };
+}
 
-    # Future: check nicknames here first
-    # if (my $nick_model = lookup_nickname($stats, $model_name)) {
-    #     return $nick_model;
-    # }
+sub find_model {
+    my ($config, $stats, $model_name, $find_opts) = @_;
+    $find_opts //= {};
+
+    # ── filter flags ──────────────────────────────────────────────────────────
+    # include_mmproj: include mmproj files alongside regular models (default off)
+    # mmproj_only:    match only mmproj files
+    my $include_mmproj = $find_opts->{include_mmproj} // 0;
+    my $mmproj_only    = $find_opts->{mmproj_only}    // 0;
+
+    # ── selection flags ───────────────────────────────────────────────────────
+    # force: when multiple match, pick #1 (highest ranked)
+    # num:   when multiple match, pick entry N from the displayed numbered list
+    my $force = $find_opts->{force} // 0;
+    my $num   = $find_opts->{num};   # undef = not specified
+
+    # Build a case-insensitive regex from the pattern.
+    # If the user put ^ it stays anchored; otherwise unanchored.
+    # Fall back to literal if the pattern isn't valid regex.
+    my $regex = eval { qr/$model_name/i } // qr/\Q$model_name\E/i;
 
     # Calculate mtime range for ranking
     my ($newest_mtime, $oldest_mtime) = (0, time);
@@ -1276,107 +1319,88 @@ sub find_model {
         $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
     }
 
-    # Try exact match first
+    # ── exact match (literal, intentional) ───────────────────────────────────
     if ($stats->{$model_name}) {
-        my $locs = $stats->{$model_name}{locations} // [];
-
-        # Check actual filesystem for SSD presence (stats might be stale)
-        my $ssd_path = $config->{ssd_path} . '/' . $model_name;
-        my $has_ssd_file = -f $ssd_path;
-        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
-
-        # Update stats if we found SSD file that's not in stats
-        if ($has_ssd_file && !$has_ssd_stat) {
-            push @$locs, 'ssd';
-            $stats->{$model_name}{locations} = $locs;
-            $stats->{$model_name}{path} = $ssd_path;
-            $stats_dirty = 1;
-        }
-
-        # Prefer SSD if available
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
-        my $path = $has_ssd_file ? $ssd_path : $stats->{$model_name}{path};
-
-        return {
-            path => $path,
-            location => $preferred,
-            locations => $locs,
-        };
+        my $is_mmproj = $model_name =~ /mmproj/i;
+        return undef if $is_mmproj && !$include_mmproj && !$mmproj_only;
+        return undef if !$is_mmproj && $mmproj_only;
+        return _resolve_match($config, $stats, $model_name);
     }
 
-    # Try substring match
-    my @matches;
+    # ── regex match — partition into models and mmproj ────────────────────────
+    my (@model_matches, @mmproj_matches);
     for my $key (keys %$stats) {
-        push @matches, $key if $key =~ /\Q$model_name\E/i;
+        next unless $key =~ $regex;
+        if ($key =~ /mmproj/i) {
+            push @mmproj_matches, $key if $include_mmproj || $mmproj_only;
+        } else {
+            push @model_matches, $key unless $mmproj_only;
+        }
     }
 
-    if (@matches == 0) {
-        return undef;
-    } elsif (@matches == 1) {
-        my $key = $matches[0];
-        my $locs = $stats->{$key}{locations} // [];
+    my @all_matches = (@model_matches, @mmproj_matches);
+    return undef   if @all_matches == 0;
+    return _resolve_match($config, $stats, $all_matches[0]) if @all_matches == 1;
 
-        # Check actual filesystem for SSD presence
-        my $ssd_path = $config->{ssd_path} . '/' . $key;
-        my $has_ssd_file = -f $ssd_path;
-        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
+    # ── multiple matches ──────────────────────────────────────────────────────
+    # Models ranked ascending (lowest first); [-1] = highest rank = #1 in display.
+    # mmproj files appended after models, sorted alphabetically.
+    my @ranked_models = sort {
+        rank_model($stats->{$a}, $newest_mtime, $oldest_mtime) <=>
+        rank_model($stats->{$b}, $newest_mtime, $oldest_mtime)
+    } @model_matches;
 
-        # Update stats if we found SSD file that's not in stats
-        if ($has_ssd_file && !$has_ssd_stat) {
-            push @$locs, 'ssd';
-            $stats->{$key}{locations} = $locs;
-            $stats->{$key}{path} = $ssd_path;
-            $stats_dirty = 1;
+    my @ranked_mmproj = sort @mmproj_matches;
+
+    # Build mmproj → linked-model map for display
+    my %mmproj_linked_to;
+    for my $k (keys %$stats) {
+        next if $k =~ /mmproj/i;
+        my $mp = basename($stats->{$k}{mmproj} // '');
+        $mmproj_linked_to{$mp} = $k if $mp;
+    }
+
+    # Display order: #1 = best model, descending rank, then mmproj
+    my @display = ((reverse @ranked_models), @ranked_mmproj);
+
+    say "${c_warn}Multiple matches for '$model_name':$rst";
+    my $n = 0;
+    for my $m (@display) {
+        $n++;
+        if ($m =~ /mmproj/i) {
+            my $linked = $mmproj_linked_to{$m};
+            my $link_str = $linked
+                ? "${gra}→ ${cya}$linked${rst}"
+                : "${c_mm_unused}(unused)${rst}";
+            printf "  %d. ${c_mm_used}%s${rst}  %s\n", $n, $m, $link_str;
+        } else {
+            my $rank    = sprintf("%.1f", rank_model($stats->{$m}, $newest_mtime, $oldest_mtime));
+            my $locs    = $stats->{$m}{locations} // [];
+            my $loc_str = (grep { $_ eq 'ssd' } @$locs) ? "  ${bcya}SSD${rst}" : '';
+            printf "  %d. ${cya}%s${rst}%s  ${gra}(rank: %s)${rst}\n", $n, $m, $loc_str, $rank;
         }
+    }
 
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
-        my $path = $has_ssd_file ? $ssd_path : $stats->{$key}{path};
-
-        return {
-            path => $path,
-            location => $preferred,
-            locations => $locs,
-        };
-    } else {
-        # Multiple matches - pick highest ranked
-        say "${yel}Multiple models found matching '$model_name':$rst";
-        my @ranked = sort {
-            rank_model($stats->{$b}, $newest_mtime, $oldest_mtime) <=>
-            rank_model($stats->{$a}, $newest_mtime, $oldest_mtime)
-        } @matches;
-
-        for my $m (@ranked) {
-            my $rank = sprintf("%.1f", rank_model($stats->{$m}, $newest_mtime, $oldest_mtime));
-            say "  $m (rank: $rank)";
+    # ── resolve selection ─────────────────────────────────────────────────────
+    my $chosen;
+    if (defined $num) {
+        if ($num !~ /^\d+$/ || $num < 1 || $num > scalar(@display)) {
+            say "${c_err}Invalid selection '$num' — pick 1-${\ scalar @display}.$rst";
+            return undef;
         }
-
-        my $chosen = $ranked[-1];  # Highest rank is at end now
+        $chosen = $display[$num - 1];
+        say "${gre}Selected #$num: $chosen$rst";
+    } elsif ($force) {
+        $chosen = $ranked_models[-1] // $ranked_mmproj[0];
         say "${gre}Using highest-ranked: $chosen$rst";
-
-        my $locs = $stats->{$chosen}{locations} // [];
-
-        # Check actual filesystem for SSD presence
-        my $ssd_path = $config->{ssd_path} . '/' . $chosen;
-        my $has_ssd_file = -f $ssd_path;
-        my $has_ssd_stat = grep { $_ eq 'ssd' } @$locs;
-
-        # Update stats if we found SSD file that's not in stats
-        if ($has_ssd_file && !$has_ssd_stat) {
-            push @$locs, 'ssd';
-            $stats->{$chosen}{locations} = $locs;
-            $stats->{$chosen}{path} = $ssd_path;
-            $stats_dirty = 1;
-        }
-
-        my $preferred = ($has_ssd_file || $has_ssd_stat) ? 'ssd' : ($locs->[0] // 'unknown');
-        my $path = $has_ssd_file ? $ssd_path : $stats->{$chosen}{path};
-
-        return {
-            path => $path,
-            location => $preferred,
-            locations => $locs,
-        };
+    } else {
+        my $count = scalar @display;
+        say "${c_notice}Use ${c_emph}-n #${rst}${c_notice} to select (1-$count),"
+          . " or ${c_emph}-f${rst}${c_notice} for highest-ranked (#1).$rst";
+        return undef;
     }
+
+    return _resolve_match($config, $stats, $chosen);
 }
 
 sub rank_model {
@@ -2051,12 +2075,13 @@ sub rename_model_entry {
 }
 
 sub show_model_details {
-    my ($config, $stats, $model_name) = @_;
+    my ($config, $stats, $model_name, $opts) = @_;
+    $opts //= {};
 
-    my $model_info = find_model($config, $stats, $model_name);
+    my $model_info = find_model($config, $stats, $model_name,
+        { force => $opts->{force}, num => $opts->{num} });
     unless ($model_info) {
-        serrl(0, "Error: Model '$model_name' not found.");
-        # QUESTIONABLE: This was an exit 1 before
+        # find_model already printed disambiguation or error
         return;
     }
 
@@ -2246,10 +2271,22 @@ sub list_models {
         $oldest_mtime = $mtime if $mtime < $oldest_mtime && $mtime > 0;
     }
 
+    # Separate mmproj entries from real models.
+    # scan_models now skips mmproj on new scans, but old stats entries may remain.
+    # In normal mode they're hidden; with -v they get their own section.
+    my (@mmproj_keys, @model_keys);
+    for my $key (keys %$stats_to_use) {
+        if ($key =~ /mmproj/i) {
+            push @mmproj_keys, $key;
+        } else {
+            push @model_keys, $key;
+        }
+    }
+
     my @models = sort {
         rank_model($stats_to_use->{$a}, $newest_mtime, $oldest_mtime) <=>
         rank_model($stats_to_use->{$b}, $newest_mtime, $oldest_mtime)
-    } keys %$stats_to_use;
+    } @model_keys;
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
 
@@ -2470,6 +2507,29 @@ sub list_models {
             say "  ${red}$path${rst}";
         }
         say "";
+    }
+
+    # In verbose mode, show mmproj files as a separate section
+    if ($verbose && @mmproj_keys) {
+        # Build set of mmproj filenames that are linked to models
+        my %used_mmproj;
+        for my $key (@model_keys) {
+            my $mp = $stats_to_use->{$key}{mmproj} // '';
+            $used_mmproj{basename($mp)} = $key if $mp;
+        }
+
+        say "\n${whi}${inv} MMPROJ files $rst\n";
+        for my $key (sort @mmproj_keys) {
+            my $mstats = $stats_to_use->{$key};
+            my $linked_to = $used_mmproj{$key};
+            if ($linked_to) {
+                say "$c_mm_used$key$rst  ${gra}→ $linked_to$rst";
+            } else {
+                say "$c_mm_unused$key$rst  ${gra}(unused)$rst";
+            }
+        }
+        say "";
+        say "${gra}Colors: ${c_mm_used}used${rst}${gra}, ${c_mm_unused}unused${rst}";
     }
 }
 
@@ -2875,6 +2935,10 @@ sub init_colors {
         $c_attn_ctx = $cya;
         $c_sel = $bmag;
         $c_tag = $gra;
+        $c_mm_unused = $bro;
+        $c_mm_used   = $rst;   # grey (terminal default / "reset" color)
+        $c_notice    = $gra;
+        $c_emph      = $whi;
     } else {
         ($bgbla, $bgred, $bggre, $bgbro, $bgblu, $bgmag, $bgcya, $bggra) = ('') x 8;
         ($bla, $red, $gre, $bro, $blu, $mag, $cya, $gra) = ('') x 8;
@@ -2883,6 +2947,7 @@ sub init_colors {
 
         # Additional color variables
         $c_warn = $c_err = $c_attn = $c_attn_ctx = $c_sel = $c_tag = '';
+        $c_mm_unused = $c_mm_used = $c_notice = $c_emph = '';
     }
 }
 
