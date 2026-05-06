@@ -381,9 +381,33 @@ sub main {
         }
     }
 
-    # Prepend global args from config
+    # Prepend global args from config, but drop any flag from globals that
+    # model-specific args already set — model-specific always wins, and this
+    # prevents duplicate flags like two -c values showing up in the command.
     my @global_args = @{$config->{global_llama_args} // []};
-    unshift @final_llama_args, @global_args;
+    if (@global_args && @final_llama_args) {
+        # Collect all flag names (args starting with -) already in final_llama_args
+        my %already_set;
+        for my $a (@final_llama_args) {
+            $already_set{$a} = 1 if $a =~ /^-/;
+        }
+        my @filtered_globals;
+        my $i = 0;
+        while ($i < @global_args) {
+            my $g = $global_args[$i];
+            if ($g =~ /^-/ && $already_set{$g}) {
+                # Skip this flag and its value (if next element isn't itself a flag)
+                $i++;
+                $i++ if $i < @global_args && $global_args[$i] !~ /^-/;
+            } else {
+                push @filtered_globals, $g;
+                $i++;
+            }
+        }
+        unshift @final_llama_args, @filtered_globals;
+    } else {
+        unshift @final_llama_args, @global_args;
+    }
 
     # Handle mmproj if associated with model and not disabled
     if (!$opts->{no_mmproj} && $mstats->{mmproj}) {
