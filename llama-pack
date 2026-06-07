@@ -2290,7 +2290,9 @@ sub list_models {
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
 
-    my $show_maxctx = $opts->{calc_maxctx} ? 1 : 0;
+    # MaxCtx column is shown automatically whenever a VRAM budget is available.
+    # No flag needed — if we can compute it, we show it.
+    my $show_maxctx = (effective_vram_gib($config, $opts) > 0) ? 1 : 0;
 
     # Determine if we need to wrap based on longest model name + stats width
     my $longest_model = 0;
@@ -2328,8 +2330,8 @@ sub list_models {
 			{ title => "Model", align => 'left' },
 			\"  ",
 		) if !$need_wrap;
-    push @cols, ("  ", { title => 'MaxCtx', align => 'right', align_title => 'right' }) if $show_maxctx;
-    push @cols, ("  ", { title => 'Tags', align => 'left' });
+    push @cols, (\"  ", { title => 'MaxCtx', align => 'right', align_title => 'right' }) if $show_maxctx;
+    push @cols, (\"  ", { title => 'Tags', align => 'left' });
 
     my $tb;
     @wrapped_indent = (' ') if $need_wrap;
@@ -2494,8 +2496,8 @@ sub list_models {
 
     say $key_line . $rst;
 
-    if ($show_maxctx && !(effective_vram_gib($config, $opts) > 0)) {
-        say "${gra}MaxCtx disabled until planner_vram_gib is set in config or --vram is provided.$rst";
+    if (!$show_maxctx) {
+        say "${gra}(MaxCtx column hidden — set planner_vram_gib in config or use --vram N to show it.)$rst";
     }
 
     # Warn about SSD-only models
