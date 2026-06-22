@@ -9,7 +9,7 @@ use File::Find;
 use File::Path qw(make_path);
 use File::Copy;
 use File::Basename;
-use File::Slurper qw(read_text write_text read_lines);
+use File::Slurper qw(read_text write_text);
 use Digest::MD5 qw(md5_hex);
 use Time::Piece;
 use Fcntl qw(:flock);
@@ -506,7 +506,7 @@ sub usage {
           --no-cuda            Suppress any stored CUDA_VISIBLE_DEVICES for this run
 
         MANAGING MODELS:
-          -l, --list           List all models with stats and rankings
+          -l, --list           List models with stats, trained context, and rankings
 
           -u, --update         Scan directories and update model index
           --uu                 Scan/update and refresh GGUF metadata for all models
@@ -1054,26 +1054,15 @@ sub estimate_max_context {
 
 sub probe_model_metadata {
     my ($config, $model_path) = @_;
-    my $metafile = "$model_path.meta";
-	my $bin = $config->{bin_gguf_dump} // 'gguf_dump.py';
-    my @lines;
+    my $bin = $config->{bin_gguf_dump} // 'gguf_dump.py';
 
-	if (-f $metafile) {
-		sel 1, "GGUF Metadata ${bgre}already exists$rst: $bcya$metafile$rst";
-		@lines = read_lines($metafile);
-		sel 1, "  ", scalar(@lines), " lines";
-		if (@lines < 10) {
-            serrl(0, "Meta data almost certainly bad at " . scalar(@lines) . " lines long: $metafile");
-            serrl(0, " Remove it to allow gguf_dump.py to try again, but probably investigate it yourself.");
-		}
-	} else {
-		open my $ph, '-|', $bin, '--verbose', $model_path
-			or die "Can't run $bin on $model_path: $!";
-		my @lines = <$ph>;
-		close $ph or die "$bin failed for $model_path";
-
-		write_text($metafile, join('', map { "$_\n" } @lines));
-	}
+    # The parsed metadata is cached in stats.json.  This probe is only called
+    # when metadata_cache_valid() says that cache needs refreshing, so a
+    # second sidecar cache beside every GGUF is unnecessary.
+    open my $ph, '-|', $bin, '--verbose', $model_path
+        or die "Can't run $bin on $model_path: $!";
+    my @lines = <$ph>;
+    close $ph or die "$bin failed for $model_path";
 
     my %kv;
     my $tensor_params = 0;
@@ -2316,8 +2305,8 @@ sub list_models {
 
     say "${whi}${inv} Models (lowest to highest rank) $rst\n";
 
-    # MaxCtx column is shown automatically whenever a VRAM budget is available.
-    # No flag needed — if we can compute it, we show it.
+    # TrnCtx comes from cached GGUF metadata. MaxCtx is shown automatically
+    # whenever a VRAM budget is available.
     my $show_maxctx = (effective_vram_gib($config, $opts) > 0) ? 1 : 0;
 
     # Determine if we need to wrap based on longest model name + stats width
@@ -2332,7 +2321,7 @@ sub list_models {
     #my $stats_width = 75;
 
 
-    my $stats_width = $show_maxctx ? 94 : 84;
+    my $stats_width = $show_maxctx ? 102 : 92;
     my $need_wrap = ($longest_model + $stats_width) > $term_width;
     my @wrapped_indent = ();
 
@@ -2356,6 +2345,7 @@ sub list_models {
 			{ title => "Model", align => 'left' },
 			\"  ",
 		) if !$need_wrap;
+    push @cols, (\"  ", { title => 'TrnCtx', align => 'right', align_title => 'right' });
     push @cols, (\"  ", { title => 'MaxCtx', align => 'right', align_title => 'right' }) if $show_maxctx;
     push @cols, (\"  ", { title => 'Tags', align => 'left' });
 
@@ -2442,6 +2432,12 @@ sub list_models {
             $tags_str = "${c_tag}$tags_display$rst";
         }
 
+        my $trainctx_str = '-';
+        if ($mstats->{gguf} && defined $mstats->{gguf}{train_ctx}
+                && $mstats->{gguf}{train_ctx} ne '') {
+            $trainctx_str = $mstats->{gguf}{train_ctx};
+        }
+
         my $maxctx_str = '';
         if ($show_maxctx) {
             my $ctx = estimate_max_context($mstats, $config, $opts);
@@ -2449,6 +2445,7 @@ sub list_models {
         }
 
         my @row = ($rank, $ssd_str, $hdd_str, $params_str, $last, $uses, "${rst}${cya}$mtime_str${rst}");
+        push @row, $trainctx_str;
         push @row, $maxctx_str if $show_maxctx;
         push @row, $tags_str;
 
