@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+#!/usr/bin/perl -d
 BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
 # system('env | grep -E "(CUDA|LLAMA|LD_|PATH)" > /tmp/script_env.txt');
 # exit;
@@ -1052,6 +1053,28 @@ sub estimate_max_context {
     return int($remaining / $kv_per_token);
 }
 
+# Return $v as a number if it is one, else undef (strings, arrays, '').
+# Keeps array-valued keys like "[0, 0, 4, 0, ...]" out of arithmetic.
+sub gguf_num {
+    my $v = shift;
+    return undef unless defined $v && !ref $v;
+    return $v + 0 if $v =~ /^\s*-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?\s*$/;
+    return undef;
+}
+
+# gguf-dump's text output truncates arrays to 6 elements; --json-array gives
+# them in full.  Returns the "metadata" hash (key => { value => ... }).
+sub gguf_dump_full_metadata {
+    my ($bin, $model_path) = @_;
+    open my $ph, '-|', $bin, '--json', '--json-array', '--no-tensors', $model_path
+        or die "Can't run $bin --json on $model_path: $!";
+    my $out = do { local $/; <$ph> } // '';
+    close $ph or die "$bin --json --json-array failed for $model_path";
+    $out =~ s/^[^{]*//;                     # skip any stray banner text
+    my $doc = decode_json($out);
+    return $doc->{metadata} // {};
+}
+
 sub probe_model_metadata {
     my ($config, $model_path) = @_;
     my $bin = $config->{bin_gguf_dump} // 'gguf_dump.py';
@@ -1092,40 +1115,107 @@ sub probe_model_metadata {
         }
     }
 
+	# .metadata["lfm3.attention.head_count_kv"].value
     my $arch = $kv{'general.architecture'} // '';
     my $ctx = $kv{"$arch.context_length"};
     my $layers = $kv{"$arch.block_count"};
     my $embed = $kv{"$arch.embedding_length"};
-    my $heads = $kv{"$arch.attention.head_count"};
-    my $heads_kv = $kv{"$arch.attention.head_count_kv"} // $heads;
     my $ffn = $kv{"$arch.feed_forward_length"};
     my $size_label = $kv{'general.size_label'};
     my $file_type = $kv{'general.file_type'};
     my $token_count = $kv{'tokenizer.ggml.tokens.count'} // $kv{'tokenizer.ggml.token_type.count'};
 
-    my $head_dim_k = $kv{"$arch.attention.key_length"};
-    my $head_dim_v = $kv{"$arch.attention.value_length"};
-    if ((!defined $head_dim_k || $head_dim_k eq '') && $embed && $heads) {
-        $head_dim_k = int($embed / $heads);
-    }
-    if ((!defined $head_dim_v || $head_dim_v eq '') && $embed && $heads) {
-        $head_dim_v = int($embed / $heads);
+    # Head counts are normally plain numbers, but hybrid models (LFM2/LFM3,
+    # ...) store head_count_kv as a per-layer array with 0 for the conv /
+    # recurrent layers, e.g. [0, 0, 4, 0, 4, 0, ...].  gguf-dump only prints
+    # the first 6 elements of an array, so when we hit one we ask it for a
+    # full JSON dump instead (once, lazily).
+    my $full_meta;
+    my $num_or_list = sub {
+        my $key = shift;
+        my $v = $kv{$key};
+        return undef unless defined $v;
+        my $n = gguf_num($v);
+        return $n if defined $n;
+        return undef unless $v =~ /^\[/;
+
+        if ($v !~ /,\s*\.\.\.\s*\]$/) {     # short array, printed in full
+            my @items = map { gguf_num($_) } split /,/, ($v =~ s/^\[|\]$//gr);
+            return (@items && !grep { !defined } @items) ? \@items : undef;
+        }
+
+        unless ($full_meta) {
+            $full_meta = eval { gguf_dump_full_metadata($bin, $model_path) };
+            unless ($full_meta) {
+                my $err = $@ || 'unknown error';
+                chomp $err;
+                say STDERR "  warning: couldn't read full array for $key: $err";
+                $full_meta = {};
+            }
+        }
+        my $arr = $full_meta->{$key}{value};
+        return undef unless ref $arr eq 'ARRAY' && @$arr;
+        my @items = map { gguf_num($_) } @$arr;
+        return (!grep { !defined } @items) ? \@items : undef;
+    };
+
+    my $n_layers = gguf_num($layers);
+    my $embed_n  = gguf_num($embed);
+
+    my $heads_v    = $num_or_list->("$arch.attention.head_count");
+    # Fall back to head_count only if head_count_kv is absent altogether; if it
+    # is present but unreadable, leave it undef rather than guess (MaxCtx '-').
+	# $DB::single=1;
+    my $heads_kv_v = exists $kv{"$arch.attention.head_count_kv"}
+        ? $num_or_list->("$arch.attention.head_count_kv")
+        : $heads_v;
+
+    # Scalar head count for the head_dim fallback (first non-zero if per-layer).
+    my $heads = ref $heads_v ? (grep { $_ } @$heads_v)[0] : $heads_v;
+
+    my $head_dim_k = gguf_num($kv{"$arch.attention.key_length"});
+    my $head_dim_v = gguf_num($kv{"$arch.attention.value_length"});
+    if ($embed_n && $heads) {
+        $head_dim_k //= int($embed_n / $heads);
+        $head_dim_v //= int($embed_n / $heads);
     }
 
-    my $n_embd_k_gqa = $kv{"$arch.attention.key_length_total"};
-    my $n_embd_v_gqa = $kv{"$arch.attention.value_length_total"};
-    if ((!defined $n_embd_k_gqa || $n_embd_k_gqa eq '') && $heads_kv && $head_dim_k) {
-        $n_embd_k_gqa = $heads_kv * $head_dim_k;
+    # KV heads for every layer.
+    my @kv_heads;
+    if (ref $heads_kv_v) {
+        @kv_heads = @$heads_kv_v;
+    } elsif (defined $heads_kv_v && $n_layers) {
+        @kv_heads = ($heads_kv_v) x $n_layers;
     }
-    if ((!defined $n_embd_v_gqa || $n_embd_v_gqa eq '') && $heads_kv && $head_dim_v) {
-        $n_embd_v_gqa = $heads_kv * $head_dim_v;
+
+    # Per-layer K/V width.  (key_length_total/value_length_total aren't
+    # standard GGUF keys, but if present they override the computed width.)
+    my $k_total = gguf_num($kv{"$arch.attention.key_length_total"});
+    my $v_total = gguf_num($kv{"$arch.attention.value_length_total"});
+    my (@k_gqa, @v_gqa);
+    if (defined $k_total && defined $v_total && $n_layers) {
+        @k_gqa = ($k_total) x $n_layers;
+        @v_gqa = ($v_total) x $n_layers;
+    } elsif ($head_dim_k && $head_dim_v) {
+        @k_gqa = map { $_ * $head_dim_k } @kv_heads;
+        @v_gqa = map { $_ * $head_dim_v } @kv_heads;
     }
+
+    # Only layers with KV heads keep a per-token cache; conv/recurrent layers
+    # have fixed-size state that doesn't grow with context.
+    my $n_kv_layers = grep { $_ > 0 } @k_gqa;
+    my ($n_embd_k_gqa) = sort { $b <=> $a } @k_gqa;
+    my ($n_embd_v_gqa) = sort { $b <=> $a } @v_gqa;
+    my ($heads_kv)     = sort { $b <=> $a } @kv_heads;
 
     my $kv_bytes_per_token;
-    if ($layers && $n_embd_k_gqa && $n_embd_v_gqa) {
+    if ($n_kv_layers) {
         my $ctk = kv_type_bytes($config->{planner_ctk});
         my $ctv = kv_type_bytes($config->{planner_ctv});
-        $kv_bytes_per_token = $layers * (($n_embd_k_gqa * $ctk) + ($n_embd_v_gqa * $ctv));
+        $kv_bytes_per_token = 0;
+        for my $il (0 .. $#k_gqa) {
+            $kv_bytes_per_token += ($k_gqa[$il] * $ctk) + ($v_gqa[$il] * $ctv);
+        }
     }
 
     my @st = stat($model_path);
@@ -1150,6 +1240,7 @@ sub probe_model_metadata {
         n_vocab => $token_count,
         n_embd_k_gqa => $n_embd_k_gqa,
         n_embd_v_gqa => $n_embd_v_gqa,
+        n_kv_layers => $n_kv_layers,
         kv_bytes_per_token => $kv_bytes_per_token,
         tokenizer_model => $kv{'tokenizer.ggml.model'},
         tokenizer_pre => $kv{'tokenizer.ggml.pre'},
