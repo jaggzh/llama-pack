@@ -1,5 +1,4 @@
 #!/usr/bin/perl
-#!/usr/bin/perl -d
 BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
 # system('env | grep -E "(CUDA|LLAMA|LD_|PATH)" > /tmp/script_env.txt');
 # exit;
@@ -88,8 +87,9 @@ sub main {
 
     # Handle commands that don't need model loading
     if ($opts->{list}) {
-        list_models($config, $opts);
-        exit 0;
+        my $shown = list_models($config, $opts);
+        # Like grep: exit 1 if a filter was given and nothing matched.
+        exit(($opts->{regex_qr} && !$shown) ? 1 : 0);
     }
 
     if ($opts->{status}) {
@@ -108,15 +108,32 @@ sub main {
     }
 
     if ($opts->{update}) {
-        scan_models($config, {
+        my $sum = scan_models($config, {
             update_details => $opts->{update_details},
             overwrite      => $opts->{overwrite},
             cache_test     => ($opts->{cache_test} // $config->{cache_test} // 'size'),
             target_model   => ($opts->{model} // $opts->{manage_model}),
         });
-        say $opts->{update_details}
-            ? "${gre}Model index and GGUF metadata updated.$rst"
-            : "${gre}Model index updated.$rst";
+        if (!$opts->{update_details}) {
+            say "${gre}Model index updated.$rst";
+        } else {
+            my @parts = ("$sum->{probed} probed");
+            push @parts, "$sum->{cached} cached" if $sum->{cached};
+            push @parts, "$sum->{failed} failed" if $sum->{failed};
+            push @parts, "$sum->{missing} missing path" if $sum->{missing};
+            my $detail = join ', ', @parts;
+            if ($sum->{failed}) {
+                say "${c_warn}Model index updated; GGUF metadata refresh had errors ($detail).$rst";
+                exit 1;
+            } elsif (!$sum->{probed} && $sum->{cached}) {
+                say "${c_warn}Model index updated; GGUF metadata NOT refreshed ($detail). "
+                  . "Use --overwrite to re-probe.$rst";
+            } elsif (!$sum->{probed}) {
+                say "${c_warn}Model index updated; no GGUF metadata probed ($detail).$rst";
+            } else {
+                say "${gre}Model index and GGUF metadata updated ($detail).$rst";
+            }
+        }
         exit 0;
     }
 
@@ -508,6 +525,11 @@ sub usage {
 
         MANAGING MODELS:
           -l, --list           List models with stats, trained context, and rankings
+          --ll, --list-filter  REGEX
+                               List only models matching REGEX (same as -l -r REGEX)
+          -r, --regex REGEX    Case-insensitive regex for features that filter by
+                               pattern (currently -l). Use (?-i) for case-sensitive.
+                               -m is unchanged: it still takes a name pattern.
 
           -u, --update         Scan directories and update model index
           --uu                 Scan/update and refresh GGUF metadata for all models
@@ -578,6 +600,8 @@ sub usage {
           $progname -m mymodel -t au -- -c 8192   # Tag and load
           $progname --uu                          # Refresh cached GGUF metadata
           $progname -l --maxctx --vram 23         # Show fit estimate for 23 GiB
+          $progname -l -r gemma                   # List only models matching 'gemma'
+          $progname --ll 'gemma|qwen.*(q8|q6)'    # Same, shorthand, with a regex
           $progname --rename old.gguf,new.gguf    # Rename model + stats entry
           $progname --gtag au:"Audio capable"     # Add tag to registry
           $progname --tl                          # List known tags
@@ -663,6 +687,16 @@ sub parse_args {
             $opts{manage_model} = shift @ARGV;
         } elsif ($arg eq '-l' || $arg eq '--list') {
             $opts{list} = 1;
+        } elsif ($arg eq '-r' || $arg eq '--regex') {
+            # Generic user regex, for any feature that filters by pattern.
+            # (Currently used by -l/--list.)  -m keeps its own name matching.
+            @ARGV or do { say STDERR "$arg requires a REGEX argument"; exit 2 };
+            $opts{regex} = shift @ARGV;
+        } elsif ($arg eq '--ll' || $arg eq '--list-filter') {
+            # Shorthand: --ll REGEX == -l -r REGEX
+            @ARGV or do { say STDERR "$arg requires a REGEX argument"; exit 2 };
+            $opts{list} = 1;
+            $opts{regex} = shift @ARGV;
         } elsif ($arg eq '-u' || $arg eq '--update') {
             $opts{update} = 1;
         } elsif ($arg eq '--uu') {
@@ -747,6 +781,20 @@ sub parse_args {
             $verbose++;
         } else {
             push @llama_args, $arg;
+        }
+    }
+
+    # Compile -r/--regex once, up front, so a bad pattern fails before any
+    # work is done.  Case-insensitive like -m; use (?-i) in the pattern for
+    # a case-sensitive match.
+    if (defined $opts{regex}) {
+        my $re_src = $opts{regex};
+        $opts{regex_qr} = eval { qr/$re_src/i };
+        unless ($opts{regex_qr}) {
+            my $err = $@ || 'unknown error';
+            $err =~ s/ at \S+ line \d+.*//s;
+            say STDERR "Invalid regex '$re_src': $err";
+            exit 2;
         }
     }
 
@@ -1115,7 +1163,6 @@ sub probe_model_metadata {
         }
     }
 
-	# .metadata["lfm3.attention.head_count_kv"].value
     my $arch = $kv{'general.architecture'} // '';
     my $ctx = $kv{"$arch.context_length"};
     my $layers = $kv{"$arch.block_count"};
@@ -1165,7 +1212,6 @@ sub probe_model_metadata {
     my $heads_v    = $num_or_list->("$arch.attention.head_count");
     # Fall back to head_count only if head_count_kv is absent altogether; if it
     # is present but unreadable, leave it undef rather than guess (MaxCtx '-').
-	# $DB::single=1;
     my $heads_kv_v = exists $kv{"$arch.attention.head_count_kv"}
         ? $num_or_list->("$arch.attention.head_count_kv")
         : $heads_v;
@@ -1323,7 +1369,7 @@ sub scan_models {
     $stats_dirty = 1;
     write_stats();
 
-    return unless $opts->{update_details};
+    return {} unless $opts->{update_details};
 
     my @targets;
     if ($opts->{target_model}) {
@@ -1338,6 +1384,8 @@ sub scan_models {
     my $cache_test = $opts->{cache_test} // $config->{cache_test} // 'size';
     my $total = scalar @targets;
     my $done = 0;
+    my ($n_cached, $n_probed, $n_failed, $n_missing) = (0, 0, 0, 0);
+    my @cached_no_kv;
 
     for my $key (@targets) {
         $done++;
@@ -1345,11 +1393,16 @@ sub scan_models {
         my $path = $entry->{path};
         unless ($path && -f $path) {
             say STDERR "[$done/$total] skipping $key (missing path)";
+            $n_missing++;
             next;
         }
 
         if (!$opts->{overwrite} && metadata_cache_valid($entry, $path, $cache_test)) {
             say STDERR "[$done/$total] cached $key" if $verbose;
+            $n_cached++;
+            # Cached, but no KV estimate: probably probed by an older version.
+            push @cached_no_kv, $key
+                unless ($entry->{gguf}{kv_bytes_per_token} // 0) > 0;
             next;
         }
 
@@ -1359,13 +1412,24 @@ sub scan_models {
             my $err = $@ || 'unknown error';
             chomp $err;
             say STDERR "  ${red}metadata probe failed${rst}: $err";
+            $n_failed++;
             next;
         }
 
+        $n_probed++;
         $entry->{gguf} = $meta;
         $stats_dirty = 1;
         write_stats();
     }
+
+    if (@cached_no_kv) {
+        say STDERR "${c_warn}Cached with no KV estimate (MaxCtx will show '-'); "
+                 . "use --overwrite to re-probe:$rst";
+        say STDERR "    $_" for @cached_no_kv;
+    }
+
+    return { probed => $n_probed, cached => $n_cached,
+             failed => $n_failed, missing => $n_missing, total => $total };
 }
 
 sub _resolve_match {
@@ -2394,7 +2458,23 @@ sub list_models {
         rank_model($stats_to_use->{$b}, $newest_mtime, $oldest_mtime)
     } @model_keys;
 
-    say "${whi}${inv} Models (lowest to highest rank) $rst\n";
+    # Optional -r/--regex filter.  Ranks/mtime range above are computed over
+    # the whole collection so a model's rank doesn't change with the filter.
+    my $total_models = scalar @models;
+    my $filter_re = $opts->{regex_qr};
+    my $filter_label = '';
+    if ($filter_re) {
+        $filter_label = "/$opts->{regex}/i";
+        @models      = grep { $_ =~ $filter_re } @models;
+        @mmproj_keys = grep { $_ =~ $filter_re } @mmproj_keys;
+        unless (@models) {
+            say STDERR "No models match $filter_label";
+            return 0;
+        }
+    }
+
+    say "${whi}${inv} Models" . ($filter_label ? " matching $filter_label" : '')
+      . " (lowest to highest rank) $rst\n";
 
     # TrnCtx comes from cached GGUF metadata. MaxCtx is shown automatically
     # whenever a VRAM budget is available.
@@ -2610,6 +2690,10 @@ sub list_models {
 
     say $key_line . $rst;
 
+    if ($filter_label) {
+        say "${gra}(" . scalar(@models) . " of $total_models models match $filter_label)$rst";
+    }
+
     if (!$show_maxctx) {
         say "${gra}(MaxCtx column hidden — set planner_vram_gib in config or use --vram N to show it.)$rst";
     }
@@ -2647,6 +2731,8 @@ sub list_models {
         say "";
         say "${gra}Colors: ${c_mm_used}used${rst}${gra}, ${c_mm_unused}unused${rst}";
     }
+
+    return scalar @models;
 }
 
 # ============================================================================
